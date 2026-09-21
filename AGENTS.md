@@ -13,9 +13,10 @@ Build an extremely lightweight AI agent that runs on a low-resource server (1GB 
 
 ## Tech Stack
 
-- **Language**: Python (chosen for low resource usage and wide availability)
+- **Language**: Python 3.11+ (tomllib is used from the stdlib for config parsing)
 - **Telegram**: raw HTTP calls with stdlib only (python-telegram-bot/aiogram evaluated; both pull heavy asyncio HTTP stacks for little gain - the Bot API is plain JSON over HTTPS)
 - **AI Backend**: OpenCode Zen and OpenCode Go via their OpenAI-compatible endpoints (`https://opencode.ai/zen/v1`, `https://opencode.ai/zen/go/v1`)
+- **Config**: TOML (`config.toml`, comments allowed) - chosen over JSON (no comments) and YAML (would need PyYAML)
 - **Dependencies**: none - everything runs on the Python standard library
 
 ## Project Structure
@@ -31,7 +32,7 @@ keirai/
 ├── telegram.py          # Telegram Bot API client (raw HTTP, multipart)
 ├── md2tg.py             # Markdown -> Telegram HTML, message splitting
 ├── providers.py         # OpenCode Zen/Go clients, model stats cache
-├── config.example.json  # Config template
+├── config.example.toml  # Config template (TOML, comments allowed)
 └── tests/               # Unit tests (unittest, stdlib)
     ├── test_md2tg.py    #   markdown conversion + splitting
     ├── test_config.py   #   config loading, access control

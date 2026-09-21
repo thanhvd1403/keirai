@@ -315,7 +315,7 @@ def main():
         cfg.validate()
     except config_mod.ConfigError as e:
         print("config error: %s" % e, file=sys.stderr)
-        print("copy config.example.json to config.json and set bot_token", file=sys.stderr)
+        print("copy config.example.toml to config.toml and set bot_token", file=sys.stderr)
         sys.exit(1)
 
     tg = tg_mod.Telegram(cfg.bot_token)

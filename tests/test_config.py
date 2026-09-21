@@ -45,16 +45,36 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(cfg.provider_key("zen"), "file-key")
 
     def test_load_from_file(self):
-        import json
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "config.json")
+            p = os.path.join(d, "config.toml")
             with open(p, "w", encoding="utf-8") as f:
-                json.dump({"bot_token": "tok", "allowed_users": [1]}, f)
+                f.write('bot_token = "tok"\nallowed_users = [1, "@someone"]\n')
             with mock.patch.dict(os.environ, {"KEIRAI_CONFIG": p}, clear=False):
                 cfg = config_mod.load()
             self.assertEqual(cfg.bot_token, "tok")
-            self.assertEqual(cfg.allowed_users, ["1"])
+            self.assertEqual(cfg.allowed_users, ["1", "someone"])
+
+    def test_invalid_toml_raises_friendly(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.toml")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("this is not = = toml {{{")
+            with mock.patch.dict(os.environ, {"KEIRAI_CONFIG": p}, clear=False):
+                with self.assertRaises(config_mod.ConfigError):
+                    config_mod.load()
+
+    def test_multiline_system_prompt(self):
+        import tempfile
+        toml = 'system_prompt = """line one\nline two"""\n'
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.toml")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(toml)
+            with mock.patch.dict(os.environ, {"KEIRAI_CONFIG": p}, clear=False):
+                cfg = config_mod.load()
+            self.assertEqual(cfg.system_prompt, "line one\nline two")
 
 
 if __name__ == "__main__":

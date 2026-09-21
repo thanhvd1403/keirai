@@ -1,8 +1,15 @@
-"""Keirai configuration: JSON file + environment variable overrides."""
-import json
+"""Keirai configuration: TOML file + environment variable overrides.
+
+Requires Python 3.11+ (tomllib is in the stdlib).
+"""
 import os
 
-CONFIG_PATHS = ["config.json"]
+try:
+    import tomllib
+except ImportError:  # pragma: no cover
+    raise SystemExit("Keirai requires Python 3.11+ (tomllib). Found an older Python.")
+
+CONFIG_PATHS = ["config.toml"]
 PROVIDER_ENV_KEYS = {
     "zen": ["KEIRAI_ZEN_API_KEY", "OPENCODE_API_KEY"],
     "go": ["KEIRAI_GO_API_KEY", "OPENCODE_API_KEY"],
@@ -57,17 +64,22 @@ class Config:
     def validate(self):
         if not self.bot_token:
             raise ConfigError(
-                "bot_token is missing. Set it in config.json or via the KEIRAI_BOT_TOKEN env var."
+                "bot_token is missing. Set it in config.toml or via the KEIRAI_BOT_TOKEN env var."
             )
 
 
 def load(path=None):
-    """Load config from `path`, the KEIRAI_CONFIG env var, or ./config.json."""
-    candidates = [path] if path else ([os.environ.get("KEIRAI_CONFIG")] if os.environ.get("KEIRAI_CONFIG") else []) + CONFIG_PATHS
+    """Load config from `path`, the KEIRAI_CONFIG env var, or ./config.toml."""
+    candidates = ([path] if path
+                  else ([os.environ["KEIRAI_CONFIG"]] if os.environ.get("KEIRAI_CONFIG") else [])
+                  + CONFIG_PATHS)
     for cand in candidates:
         if cand and os.path.isfile(cand):
-            with open(cand, "r", encoding="utf-8") as f:
-                return Config(json.load(f), path=cand)
+            try:
+                with open(cand, "rb") as f:
+                    return Config(tomllib.load(f), path=cand)
+            except tomllib.TOMLDecodeError as e:
+                raise ConfigError("%s is not valid TOML: %s" % (cand, e))
     return Config({}, path=None)
 
 

@@ -110,3 +110,14 @@
 - [ ] List available models per provider (`/models` should include them)
 - [ ] Auto-retrieve model stats where the provider supports it (max context window, costs, ...)
 - [ ] Per-provider/per-model overrides in config (e.g. manual context window, cost values for providers that don't report stats)
+
+### 15. Interactive setup script
+- [ ] `python setup.py` wizard that:
+  - Prompts for bot token (validate live via `getMe` before saving)
+  - Prompts for provider API keys (validate by fetching `/models`)
+  - Asks for allowed users (IDs/usernames) or allow-all
+  - Writes `config.json` in the project dir
+- [ ] Optional keep-alive service install, per user choice at the end:
+  - Detect systemd; if present, offer to install the unit with correct User/paths, then `daemon-reload` + `enable --now`
+  - Skip gracefully (with a printed hint) when systemd is unavailable
+- [ ] Rerunnable: detect existing config and offer to edit values instead of overwriting
