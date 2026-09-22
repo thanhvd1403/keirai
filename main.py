@@ -273,7 +273,16 @@ def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     provider_name, model_id = model_full.split("/", 1)
     api_key = cfg.provider_key(provider_name)
     if not api_key:
-        _err(tg, msg, thread_id, "no API key for provider '%s'" % provider_name)
+        # fall back to the other provider (prefer go), keys are endpoint-bound
+        alt = "go" if provider_name != "go" else "zen"
+        alt_key = cfg.provider_key(alt)
+        if alt_key:
+            log.info("no API key for provider '%s' - routing model '%s' via '%s'",
+                     provider_name, model_id, alt)
+            provider_name, api_key = alt, alt_key
+    if not api_key:
+        _err(tg, msg, thread_id, "no API key for provider '%s' (or fallback 'go'/'zen')"
+             % provider_name)
         return
 
     content = [{"type": "text", "text": text or "Describe the image."}]
@@ -426,7 +435,11 @@ def handle_message(cfg, tg, msg, state):
     thread_id = msg.get("message_thread_id")
     user = msg.get("from") or {}
     if not cfg.is_allowed(user.get("id"), user.get("username")):
+        log.info("ignored message from user %s (@%s) - not in allowed_users",
+                 user.get("id"), user.get("username"))
         return  # silently ignore non-allowed users
+    log.info("message from user %s (@%s) chat=%s thread=%s",
+             user.get("id"), user.get("username"), chat_id, thread_id)
 
     text = msg.get("text") or msg.get("caption") or ""
     if text.startswith("/"):

@@ -29,6 +29,8 @@ class Config:
             self.allowed_users = "all"
         elif isinstance(allowed, list):
             self.allowed_users = [str(u).lstrip("@").lower() for u in allowed]
+        elif isinstance(allowed, (str, int)):  # single ID/username, no list
+            self.allowed_users = [str(allowed).lstrip("@").lower()]
         else:
             self.allowed_users = []
         self.thinking_default = bool(data.get("thinking_default", True))

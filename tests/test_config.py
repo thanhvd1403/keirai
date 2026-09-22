@@ -20,6 +20,14 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(cfg.is_allowed(999, "intruder"))
         self.assertFalse(cfg.is_allowed(999))
 
+    def test_allowed_bare_scalar(self):
+        self.assertEqual(config_mod.Config({"allowed_users": 12345}).allowed_users, ["12345"])
+        self.assertTrue(config_mod.Config({"allowed_users": 12345}).is_allowed(12345))
+        self.assertEqual(config_mod.Config({"allowed_users": "bob"}).allowed_users, ["bob"])
+        self.assertTrue(config_mod.Config({"allowed_users": "bob"}).is_allowed(1, "bob"))
+        self.assertFalse(config_mod.Config({"allowed_users": "bob"}).is_allowed(2))
+        self.assertTrue(config_mod.Config({"allowed_users": "ALL"}).allowed_users == "all")
+
     def test_validate_missing_token(self):
         cfg = config_mod.Config({})
         with mock.patch.dict(os.environ, {}, clear=True):

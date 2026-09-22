@@ -152,6 +152,23 @@ class TestRouter(unittest.TestCase):
         self.assertEqual(len(self.tg.rich), 1)
         self.assertIn("| Provider | Model |", self.tg.rich[0][1]["markdown"])
 
+    @mock.patch.object(providers, "chat", return_value=("answer", ""))
+    def test_key_fallback_prefers_go(self, chat_mock):
+        self.cfg = make_config(providers={"zen": {"api_key": ""}, "go": {"api_key": "gk"}})
+        main.handle_message(self.cfg, self.tg, msg(text="/thinking off"), self.state)
+        self.tg.rich.clear()
+        self.tg.sent.clear()
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        # default model is zen/... but zen has no key -> routed via go
+        self.assertEqual(chat_mock.call_args[0][0], "go")
+
+    @mock.patch.object(providers, "chat", return_value=("answer", ""))
+    def test_no_keys_at_all_errors(self, chat_mock):
+        self.cfg = make_config(providers={"zen": {"api_key": ""}, "go": {"api_key": ""}})
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        chat_mock.assert_not_called()
+        self.assertTrue(any("no API key" in t for _, t, _ in self.tg.sent))
+
     @mock.patch.object(providers, "chat", return_value=("nice pic", ""))
     def test_photo_goes_to_vision(self, chat_mock):
         m = msg(text=None, photo=[{"file_id": "f1", "file_size": 100}])
