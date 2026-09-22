@@ -296,7 +296,9 @@ def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
 
     tg.typing(msg["chat"]["id"], thread_id)
     try:
-        answer, reasoning = providers.chat(provider_name, api_key, model_id, messages)
+        session_id = "keirai-%s-%s" % (msg["chat"]["id"], thread_id or "main")
+        answer, reasoning = providers.chat(provider_name, api_key, model_id, messages,
+                                           session_id=session_id)
     except Exception as e:
         history.pop()  # don't keep failed turns
         _err(tg, msg, thread_id, "%s error: %s" % (provider_name, e))

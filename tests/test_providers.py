@@ -41,26 +41,30 @@ class TestNormalize(unittest.TestCase):
 
 
 class TestChatParsing(unittest.TestCase):
-    def _chat(self, message):
+    def _chat(self, message, **kw):
         resp = {"choices": [{"message": message}]}
         with mock.patch.object(providers, "_request", return_value=resp) as req:
-            out = providers.chat("zen", "key", "m", [{"role": "user", "content": "hi"}])
+            out = providers.chat("zen", "key", "m", [{"role": "user", "content": "hi"}], **kw)
         req.assert_called_once()
         args = req.call_args
         self.assertIn("/chat/completions", args[0][0])
         self.assertEqual(args[1]["payload"]["model"], "m")
-        return out
+        return out, args
+
+    def test_session_header_passed(self):
+        _, args = self._chat({"content": "a"}, session_id="keirai-100-77")
+        self.assertEqual(args[1]["session_id"], "keirai-100-77")
 
     def test_reasoning_content(self):
-        content, reasoning = self._chat({"content": "answer", "reasoning_content": "thinking..."})
+        (content, reasoning), _ = self._chat({"content": "answer", "reasoning_content": "thinking..."})
         self.assertEqual((content, reasoning), ("answer", "thinking..."))
 
     def test_reasoning_dict(self):
-        content, reasoning = self._chat({"content": "a", "reasoning": {"content": "r"}})
+        (content, reasoning), _ = self._chat({"content": "a", "reasoning": {"content": "r"}})
         self.assertEqual(reasoning, "r")
 
     def test_no_reasoning(self):
-        content, reasoning = self._chat({"content": "a"})
+        (content, reasoning), _ = self._chat({"content": "a"})
         self.assertEqual(reasoning, "")
 
 

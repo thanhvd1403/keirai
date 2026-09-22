@@ -25,8 +25,12 @@ class ProviderError(Exception):
 
 # ---------------------------------------------------------------- http
 
-def _request(url, api_key, payload=None, timeout=30):
+def _request(url, api_key, payload=None, timeout=30, session_id=None):
     headers = {"Authorization": "Bearer %s" % api_key, "User-Agent": "keirai/0.1"}
+    if session_id:
+        # OpenCode Go requires a stable per-conversation session id
+        # (https://opencode.ai/docs/go/#where-can-i-use-it)
+        headers["x-opencode-session"] = session_id
     if payload is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode("utf-8")
@@ -144,15 +148,20 @@ def cached_models(name, api_key, cache_dir, force_refresh=False):
 
 # ---------------------------------------------------------------- chat
 
-def chat(name, api_key, model, messages, extra=None):
-    """One chat completion. Returns (content, reasoning)."""
+def chat(name, api_key, model, messages, extra=None, session_id=None):
+    """One chat completion. Returns (content, reasoning).
+
+    session_id: stable per-conversation id, required by OpenCode Go
+    (sent as x-opencode-session header).
+    """
     base = PROVIDER_BASES.get(name)
     if not base:
         raise ProviderError("unknown provider: %s" % name)
     payload = {"model": model, "messages": messages}
     if extra:
         payload.update(extra)
-    resp = _request(base + "/chat/completions", api_key, payload=payload, timeout=CHAT_TIMEOUT)
+    resp = _request(base + "/chat/completions", api_key, payload=payload,
+                    timeout=CHAT_TIMEOUT, session_id=session_id)
     try:
         msg = resp["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
