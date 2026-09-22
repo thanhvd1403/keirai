@@ -12,7 +12,7 @@
   - Decision: raw HTTP with stdlib only - zero dependencies, zero license risk, minimal RAM
 
 ### 2. Bot skeleton & access control
-- [x] Config system (bot token via env var or config file)
+- [x] Config system (TOML `config.toml`, comments allowed; env var overrides; Python 3.11+ via stdlib tomllib)
 - [x] Config for allowed users (list of user IDs/usernames), with an option to allow all users
 - [x] Ignore/reject messages from users not on the allow list
 - [x] Minimal bot: receive message → send it back (proof of life)
@@ -50,33 +50,59 @@
 - [x] Size limits + memory-safe handling (don't load big files fully into RAM)
   - Download cap 20 MB (Bot API limit), upload cap 45 MB, config `max_file_mb`
 
+### 7. Logging & ops
+- [x] Log to file: `logs/keirai.log` (rotating 2MB x 3, plus stderr for journald)
+  - Stream live: `tail -f ~/keirai/logs/keirai.log` (or `less +F`, `journalctl -u keirai -f`)
+- [x] `/reset-all`: wipes everything for the chat - all sessions/context and deletes the Telegram topics the bot created
+  - Confirmation: bot generates two random strings, user must type them back (e.g. `/reset-all KX3P QW9Z`)
+  - Hidden from /help (tracked topics only - topics created before this feature can't be listed via Bot API)
+
+### 8. Rich Messages (Bot API 10.1)
+- [x] Send ALL AI answers via `sendRichMessage` - markdown passed through, Telegram's server parses GFM: native tables, task lists, headings, `$$formulas$$`, 32768 char limit
+  - `rich_messages` config kill-switch (default on); automatic fallback to regular messages on TelegramError
+- [x] Thinking display as native collapsible `<details><summary>` block (rich HTML path, converted via our md2tg)
+- [x] `/test_rich` command + regular-message fallback kept for old paths (`/test_md`)
+- [ ] Streaming drafts: `sendRichMessageDraft` + `<tg-thinking>` placeholder while generating (needs provider streaming first)
+- [ ] Explore: `<mark>`, footnotes, media blocks in answers, `editMessageText(rich_message=...)` for live edits
+
 ## P1 - Session Management & Context Control
 
-### 7. Sessions via Telegram topics
-- [ ] Use Telegram's forum topic API: each topic = 1 chat session with its own context
-  - Requires the bot to run in a forum-enabled supergroup (topics don't exist in private chats - decide fallback behavior)
-- [ ] Create sessions: `/new` creates a new topic + fresh session
-- [ ] Rename sessions: `/rename <name>` renames the current topic/session
-- [ ] Keep context strictly isolated per topic
+### 9. Sessions via Telegram topics
+- [x] Use Telegram's forum topic API: each topic = 1 chat session with its own context
+  - Bot API 9.3 (Dec 2025) brought topics to private chats with bots - enable topic mode via @BotFather; `getMe.has_topics_enabled` confirms it
+  - Works in forum supergroups the same way (message_thread_id routing)
+  - Fallback when topics are disabled: `/new` clears the current session in place
+- [x] Create sessions: `/new [name]` creates a new topic + fresh session (auto-names "Session N" without arg)
+- [x] Rename sessions: `/rename <name>` renames the current topic/session
+- [x] Keep context strictly isolated per topic (history + model choice keyed by (chat, thread))
 - [ ] Storage for session context (in-memory first; SQLite/files when CLI management needs it)
 
-### 8. Context window management
+### 10. /delete command
+- [ ] `/delete` clears the current session's context (the conversation memory)
+- [ ] Do NOT delete the Telegram topic - send a confirmation that the session is deleted and note the user can delete the topic manually
+
+### 11. Context window management
 - [ ] Configurable limit for context size (metric TBD: chars or tokens)
 - [ ] `/compact` slash command: manually compact the current session's context
 - [ ] Auto-compact when context exceeds the configured limit
 - [ ] Compaction strategy (TBD): summarize older messages, keep recent ones
 
-### 9. CLI fallback for session management
+### 12. CLI fallback for session management
 - [ ] Simple CLI entry point to manage sessions without Telegram (e.g. admin/recovery when bot is down)
 - [ ] List sessions (id, name, size, last active)
 - [ ] Rename sessions
 - [ ] Delete sessions
 
+### 13. /help command listing
+- [ ] `/help` lists all available commands dynamically (so far)
+  - Build the list from registered command handlers, not a hardcoded string - new commands appear automatically
+- [ ] Register commands with Telegram's `setMyCommands` so they show up in the bot's UI menu
+
 ## P2 - Core Tools & Message Context
 
 > First real tools for the agent. Build on the tool registry/interface design.
 
-### 10. File & shell tools
+### 14. File & shell tools
 - [ ] `read_file` - read file contents (with size limits)
 - [ ] `write_file` - create/overwrite files
 - [ ] `edit_file` - targeted edit (search/replace, not full rewrite)
@@ -84,20 +110,20 @@
   - Timeout + output size limits
   - Safety measures (TBD: confirmation, blacklist, sandboxing)
 
-### 11. Web search & fetch (Parallel API)
+### 15. Web search & fetch (Parallel API)
 - [ ] `web_search` via Parallel Search API (parallel.ai, built for AI agents)
 - [ ] `web_fetch` via Parallel Extract API (full/excerpted content, handles JS-heavy pages and PDFs)
 - [ ] API key via config
 - [ ] Check Parallel license/pricing terms before implementing
 
-### 12. Browser (Lightpanda)
+### 16. Browser (Lightpanda)
 - [ ] Use Lightpanda headless browser (lightpanda.io) for pages needing full JS rendering
   - Written in Zig, ~16x less RAM than headless Chrome - fits our memory budget
 - [ ] Drive it from Python via CDP (Playwright/Puppeteer-compatible) or its HTTP API
 - [ ] Start/stop browser process on demand (don't keep it resident)
 - [ ] Check Lightpanda license compatibility before implementing
 
-### 13. Reply-to-message context
+### 17. Reply-to-message context
 - [ ] Detect replies via `reply_to_message` on incoming Telegram updates
 - [ ] Detect quoted text (Telegram `quote` object) and distinguish "replying to this message" vs "quoting this part"
 - [ ] Inject the referenced message into the LLM context as an annotation, e.g. "user is replying to this message: ..." / "user is quoting: ..."
@@ -105,13 +131,13 @@
 
 ## P3 - Custom OpenAI-Compatible Providers
 
-### 14. Custom providers
+### 18. Custom providers
 - [ ] Support custom OpenAI-compatible providers via config (base URL + API key)
 - [ ] List available models per provider (`/models` should include them)
 - [ ] Auto-retrieve model stats where the provider supports it (max context window, costs, ...)
 - [ ] Per-provider/per-model overrides in config (e.g. manual context window, cost values for providers that don't report stats)
 
-### 15. Interactive setup script
+### 19. Interactive setup script
 - [ ] `python setup.py` wizard that:
   - Prompts for bot token (validate live via `getMe` before saving)
   - Prompts for provider API keys (validate by fetching `/models`)

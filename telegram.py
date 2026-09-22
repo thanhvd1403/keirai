@@ -50,6 +50,9 @@ class Telegram:
 
     # ------------------------------------------------------------ updates
 
+    def get_me(self):
+        return self.call("getMe")
+
     def get_updates(self, offset=None):
         payload = {
             "timeout": POLL_TIMEOUT,
@@ -72,6 +75,15 @@ class Telegram:
             payload["message_thread_id"] = thread_id
         return self.call("sendMessage", payload)
 
+    def send_rich(self, chat_id, markdown=None, html=None, thread_id=None):
+        """Bot API 10.1+ rich message: headings, tables, task lists, details.
+        Exactly one of markdown/html must be given. Supports 32768 chars."""
+        rich = {"markdown": markdown} if markdown is not None else {"html": html}
+        payload = {"chat_id": chat_id, "rich_message": rich}
+        if thread_id:
+            payload["message_thread_id"] = thread_id
+        return self.call("sendRichMessage", payload, timeout=60)
+
     def typing(self, chat_id, thread_id=None):
         payload = {"chat_id": chat_id, "action": "typing"}
         if thread_id:
@@ -80,6 +92,23 @@ class Telegram:
             return self.call("sendChatAction", payload)
         except TelegramError:
             return None  # non-critical
+
+    # ------------------------------------------------------------ topics
+    # Works in forum supergroups and (Bot API 9.3+) in private chats when
+    # topic mode is enabled for the bot via @BotFather (getMe.has_topics_enabled).
+
+    def create_topic(self, chat_id, name):
+        return self.call("createForumTopic", {"chat_id": chat_id, "name": name})
+
+    def edit_topic(self, chat_id, thread_id, name):
+        return self.call("editForumTopic", {
+            "chat_id": chat_id, "message_thread_id": thread_id, "name": name,
+        })
+
+    def delete_topic(self, chat_id, thread_id):
+        return self.call("deleteForumTopic", {
+            "chat_id": chat_id, "message_thread_id": thread_id,
+        })
 
     # ------------------------------------------------------------ media
 

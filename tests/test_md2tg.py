@@ -94,6 +94,80 @@ class TestSplit(unittest.TestCase):
         self.assertEqual(md2tg.split(""), [""])
 
 
+class TestNesting(unittest.TestCase):
+    """The HTTP 400 bug: interleaved tags from regex conversion."""
+
+    def test_italic_bold_interleave(self):
+        out = md2tg.convert("*see **this* now**")
+        # must not contain </i> followed by </b> in a way that crosses: b opened inside i must close inside i
+        self.assertEqual(count(out, "i"), count(out, "</i>"))
+        self.assertEqual(count(out, "b"), count(out, "</b>"))
+
+    def test_all_weird_orders_stay_balanced(self):
+        cases = [
+            "*a **b* c**",
+            "**x *y** z*",
+            "*a* **b** *c*",
+            "**bold with ~~strike~~ and ||spoiler||**",
+            "*outer **inner ~~deep~~* end**",
+        ]
+        for c in cases:
+            out = md2tg.convert(c)
+            for tag in ("b", "i", "s", "tg-spoiler"):
+                self.assertEqual(count(out, tag), count(out, "</%s>" % tag), msg=c)
+
+    def test_stray_closer_dropped(self):
+        out = md2tg._balance("hello </b> world")
+        self.assertNotIn("</b>", out)
+        self.assertIn("hello", out)
+
+
+class TestLists(unittest.TestCase):
+    def test_dash_list_bullets(self):
+        out = md2tg.convert("- one\n- two")
+        self.assertEqual(out, "\u2022 one\n\u2022 two")
+
+    def test_star_and_plus_lists(self):
+        self.assertEqual(md2tg.convert("* one"), "\u2022 one")
+        self.assertEqual(md2tg.convert("+ one"), "\u2022 one")
+
+    def test_nested_lists(self):
+        out = md2tg.convert("- top\n  - sub\n- top2")
+        lines = out.split("\n")
+        self.assertEqual(lines[0], "\u2022 top")
+        self.assertEqual(lines[1], "  - sub")
+        self.assertEqual(lines[2], "\u2022 top2")
+
+    def test_nested_lists_with_bold(self):
+        out = md2tg.convert("- **bold item**\n  - plain sub")
+        lines = out.split("\n")
+        self.assertEqual(lines[0], "\u2022 <b>bold item</b>")
+        self.assertEqual(lines[1], "  - plain sub")
+
+    def test_not_a_list(self):
+        self.assertEqual(md2tg.convert("-"), "-")
+        self.assertEqual(md2tg.convert("---"), "---")
+
+
+class TestTables(unittest.TestCase):
+    def test_table_as_aligned_pre(self):
+        md = "| Name | Age |\n|---|---|\n| Alice | 30 |\n| Bob | 5 |"
+        out = md2tg.convert(md)
+        self.assertIn("<pre>", out)
+        self.assertIn("Name   Age", out)
+        self.assertIn("----------", out)
+        self.assertIn("Alice  30", out)
+        self.assertIn("Bob    5", out)
+
+    def test_table_escapes_html(self):
+        md = "| A | B |\n|---|---|\n| <x> | 1 |"
+        out = md2tg.convert(md)
+        self.assertIn("&lt;x&gt;", out)
+        self.assertNotIn("<x>", out.replace("<pre>", "").replace("</pre>", ""))
+
+    def test_non_table_pipes_untouched(self):
+        out = md2tg.convert("a | b without table\nno separator below\nplain")
+        self.assertNotIn("<pre>", out)
 class TestThinking(unittest.TestCase):
     def test_send_parts_thinking_first(self):
         parts = md2tg.send_parts("The answer is **42**.", "Let me think about this...")
@@ -116,6 +190,28 @@ class TestThinking(unittest.TestCase):
         parts = md2tg.send_parts(answer, thinking)
         for p in parts:
             self.assertLessEqual(len(p), 4096)
+
+
+class TestRichSplit(unittest.TestCase):
+    def test_small_untouched(self):
+        self.assertEqual(md2tg.split_rich("# hi\n\nbody"), ["# hi\n\nbody"])
+
+    def test_large_markdown_chunked(self):
+        md = "\n\n".join("para %d\n%s" % (i, "y" * 300) for i in range(300))
+        parts = md2tg.split_rich(md)
+        self.assertGreater(len(parts), 1)
+        for p in parts:
+            self.assertLessEqual(len(p), 30000)
+
+    def test_code_fence_intact(self):
+        body = "\n".join("code line %d" % i for i in range(4000))
+        md = "intro\n```python\n%s\n```" % body
+        parts = md2tg.split_rich(md, limit=10000)
+        self.assertGreater(len(parts), 1)
+        for p in parts:
+            self.assertLessEqual(len(p), 10000)
+            if "```python" in p or "```" in p:
+                self.assertEqual(p.count("```") % 2, 0, msg=p[:80])
 
 
 if __name__ == "__main__":

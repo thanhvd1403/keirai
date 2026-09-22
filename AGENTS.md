@@ -10,6 +10,7 @@ Build an extremely lightweight AI agent that runs on a low-resource server (1GB 
 2. **Keep it expandable** - The architecture must allow adding new tools and capabilities without major refactoring.
 3. **No unnecessary abstractions** - Use the simplest solution that works.
 4. **Prefer built-in modules** - Only add external dependencies when the built-in alternative is truly insufficient.
+5. **Ask when unsure** - Ask the user for clarification on everything that is ambiguous or needs a decision; don't guess.
 
 ## Tech Stack
 
@@ -44,15 +45,19 @@ Run tests: `python -m unittest discover -s tests`
 
 ## Current Status
 
-P0 complete and tested (48 tests). The bot does:
+P0 complete and tested (78 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
+- Config in TOML (`config.toml`, comments allowed) with env overrides
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), in-memory history per chat
-- Markdown -> Telegram HTML rendering with 4096-char splitting (never breaks code blocks)
-- Thinking/reasoning display as expandable blockquotes, `/thinking on|off` toggle
+- Sessions via Telegram topics (Bot API 9.3 private-chat topics, needs @BotFather toggle): `/new [name]`, `/rename <name>`, per-topic context isolation; `/reset-all` wipes everything (2-string confirmation, deletes tracked topics)
+- AI answers sent as Bot API 10.1 Rich Messages: markdown passthrough (native tables, task lists, headings, formulas, 32k chars), thinking as collapsible `<details>`; `rich_messages` config toggle + automatic fallback to regular messages
+- Regular-message fallback path: Markdown -> Telegram HTML rendering with 4096-char splitting (never breaks code blocks; tables as aligned `<pre>`, nested list bullets)
+- `/test_md` (regular pipeline) and `/test_rich` (rich pipeline) for live rendering verification
 - `/models` lists models with auto-fetched stats (context window, costs) from provider APIs, cached on disk; `/model provider/id` switches models
 - Photos -> vision models; media round-trip test via caption `media_test`
+- Logging: stderr + `logs/keirai.log` (rotating)
 
-Not implemented yet: sessions/topics, compaction, tools (P1+ - see TODO.md).
+Not implemented yet: context compaction, session persistence, tools (P1+ - see TODO.md).
 
 ## License
 

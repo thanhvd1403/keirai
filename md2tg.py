@@ -13,6 +13,9 @@ QUOTE_OVERHEAD = len("<blockquote expandable></blockquote>")
 
 _FENCE_RE = re.compile(r"^(```|~~~)\s*([^\s`]*)\s*$")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_LIST_RE = re.compile(r"^(\s*)[*+-] +(.*)$")  # -, * and + list markers
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+_TAG_RE = re.compile(r"(<[^>]+>)")
 
 
 # ---------------------------------------------------------------- blocks
@@ -82,18 +85,109 @@ def _inline(seg):
         out.append("<code>" + _html.escape(m.group(1), quote=False) + "</code>")
         pos = m.end()
     out.append(_inline_text(seg[pos:]))
+    return _balance("".join(out))
+
+
+def _balance(h):
+    """Fix tag nesting so Telegram never sees interleaved tags.
+
+    Sequential regex conversion can produce <i>..<b>..</i>..</b> which
+    Telegram rejects (HTTP 400 'unmatched end tag'). This closes tags in
+    LIFO order and reopens them, and drops stray closers.
+    """
+    out = []
+    stack = []
+    for tok in _TAG_RE.split(h):
+        if not tok:
+            continue
+        if tok.startswith("</"):
+            name = tok[2:].rstrip(">")
+            if name in stack:
+                closed = []
+                while stack and stack[-1] != name:
+                    closed.append(stack.pop())
+                    out.append("</%s>" % closed[-1])
+                stack.pop()
+                out.append("</%s>" % name)
+                for t in reversed(closed):  # reopen what we had to close early
+                    out.append("<%s>" % t)
+                    stack.append(t)
+            # stray closer without opener: drop
+        elif tok.startswith("<"):
+            stack.append(tok[1:].split()[0].rstrip(">").rstrip("/"))
+            out.append(tok)
+        else:
+            out.append(tok)
+    while stack:
+        out.append("</%s>" % stack.pop())
     return "".join(out)
+
+
+def _render_list_item(m):
+    """List item -> bullet with indentation. Level 0 = white bullet,
+    deeper levels = '-'. Indent 2 spaces per level."""
+    indent, content = m.group(1), m.group(2)
+    level = len(indent) // 2
+    bullet = "\u2022" if level == 0 else "-"
+    return "%s%s %s" % ("  " * level, bullet, _inline(content))
+
+
+def _row_cells(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _is_table_start(lines, i):
+    return (i + 1 < len(lines) and "|" in lines[i]
+            and _TABLE_SEP_RE.match(lines[i + 1]) is not None)
+
+
+def _read_table(lines, i):
+    rows = [_row_cells(lines[i])]
+    j = i + 2  # skip header + separator
+    while j < len(lines) and "|" in lines[j] and lines[j].strip():
+        rows.append(_row_cells(lines[j]))
+        j += 1
+    return rows, j
+
+
+def _render_table(rows):
+    """Telegram has no table markup -> render as an aligned <pre> block."""
+    ncols = max(len(r) for r in rows)
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+    widths = [max(len(r[c]) for r in rows) for c in range(ncols)]
+    header = "  ".join(c.ljust(widths[k]) for k, c in enumerate(rows[0])).rstrip()
+    body = ["  ".join(c.ljust(widths[k]) for k, c in enumerate(r)).rstrip()
+            for r in rows[1:]]
+    out = [header, "-" * len(header)] + body
+    return "<pre>" + _html.escape("\n".join(out), quote=False) + "</pre>"
 
 
 def _convert_lines(lines, headings=True):
     parts = []
-    for line in lines:
+    i = 0
+    while i < len(lines):
+        if "|" in lines[i] and _is_table_start(lines, i):
+            rows, i = _read_table(lines, i)
+            parts.append(_render_table(rows))
+            continue
+        m = _LIST_RE.match(lines[i])
+        if m:
+            parts.append(_render_list_item(m))
+            i += 1
+            continue
         if headings:
-            m = _HEADING_RE.match(line)
+            m = _HEADING_RE.match(lines[i])
             if m:
                 parts.append("<b>" + _inline(m.group(2)) + "</b>")
+                i += 1
                 continue
-        parts.append(_inline(line))
+        parts.append(_inline(lines[i]))
+        i += 1
     return "\n".join(parts)
 
 
@@ -240,3 +334,73 @@ def send_parts(answer_md, thinking_md=None, limit=TELEGRAM_LIMIT):
             parts.append("<blockquote expandable>%s</blockquote>" % c)
     parts.extend(split(answer_md, limit))
     return parts
+
+
+# ------------------------------------------------- rich messages (Bot API 10.1+)
+
+RICH_LIMIT = 30000  # Telegram allows 32768; keep a margin
+
+
+def _rich_code_chunks(lang, body, limit):
+    """Split an oversized code block into fenced source pieces."""
+    fence_len = len("```%s\n\n```" % (lang or ""))
+    max_inner = max(limit - fence_len, 32)
+    pieces, cur, cur_len = [], [], 0
+    for line in body.split("\n"):
+        while len(line) + 1 > max_inner:
+            if cur:
+                pieces.append("\n".join(cur))
+                cur, cur_len = [], 0
+            pieces.append(line[:max_inner - 1])
+            line = line[max_inner - 1:]
+        if cur and cur_len + len(line) + 1 > max_inner:
+            pieces.append("\n".join(cur))
+            cur, cur_len = [], 0
+        cur.append(line)
+        cur_len += len(line) + 1
+    if cur:
+        pieces.append("\n".join(cur))
+    return ["```%s\n%s\n```" % (lang or "", p) for p in pieces]
+
+
+def split_rich(md, limit=RICH_LIMIT):
+    """Split raw markdown into source chunks for sendRichMessage (the
+    server parses GFM, so we only need source-level block splitting)."""
+    chunks, cur, cur_len = [], [], 0
+    for block in split_blocks(md):
+        if block[0] == "blank":
+            continue
+        src = _block_source(block)
+        need = len(src) + (2 if cur else 0)
+        if cur_len + need <= limit:
+            cur.append(src)
+            cur_len += need
+            continue
+        if cur:
+            chunks.append("\n\n".join(cur))
+            cur, cur_len = [], 0
+        if len(src) <= limit:
+            chunks.append(src)
+        elif block[0] == "code":
+            chunks.extend(_rich_code_chunks(block[1], block[2], limit))
+        else:
+            lines = block[2] if isinstance(block[2], list) else [block[2]]
+            piece, piece_len = "", 0
+            for line in lines:
+                cand = (piece + "\n" + line) if piece else line
+                if len(cand) <= limit:
+                    piece = cand
+                    piece_len = len(cand)
+                    continue
+                if piece:
+                    chunks.append(piece)
+                while len(line) > limit:
+                    chunks.append(line[:limit])
+                    line = line[limit:]
+                piece = line
+                piece_len = len(line)
+            if piece:
+                chunks.append(piece)
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks or [md]

@@ -32,6 +32,7 @@ class Config:
         else:
             self.allowed_users = []
         self.thinking_default = bool(data.get("thinking_default", True))
+        self.rich_messages = bool(data.get("rich_messages", True))
         self.default_model = data.get("default_model", "zen/glm-5.3-flash")
         self.max_file_mb = int(data.get("max_file_mb", 20))
         self.system_prompt = data.get("system_prompt", "You are Keirai, a lightweight AI agent.")

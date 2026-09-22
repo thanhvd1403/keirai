@@ -1,11 +1,15 @@
 """Keirai entry point: Telegram long-polling loop, commands, AI chat.
 
-Stdlib only. Run: python main.py  (config from ./config.json or KEIRAI_CONFIG)
+Stdlib only. Run: python main.py  (config from ./config.toml or KEIRAI_CONFIG)
 """
 import base64
 import html
+import logging
+import logging.handlers
 import mimetypes
 import os
+import secrets
+import string
 import sys
 import time
 
@@ -13,6 +17,8 @@ import config as config_mod
 import md2tg
 import providers
 import telegram as tg_mod
+
+log = logging.getLogger("keirai")
 
 HISTORY_LIMIT = 24  # messages per chat kept in memory
 TEXT_EXTS = {
@@ -24,10 +30,14 @@ IMAGE_MIMES = ("image/jpeg", "image/png", "image/gif", "image/webp")
 
 
 class State:
-    """In-memory state (P0). Replaced by persistent sessions in P1."""
+    """In-memory state (P0). Sessions persist in P1+."""
 
     def __init__(self, thinking_default):
         self._default = thinking_default
+        self.topics_enabled = False  # bot has topic mode in private chats (getMe)
+        self.session_count = {}  # chat_id -> int, for auto session names
+        self.topics = {}         # chat_id -> [thread_id] of topics we created
+        self.pending_reset = {}  # chat_id -> (s1, s2) confirmation challenge
         self.thinking = {}   # user_id -> bool
         self.model = {}      # (chat_id, thread) -> "provider/model"
         self.history = {}    # (chat_id, thread) -> [messages]
@@ -47,6 +57,11 @@ class State:
     def get_history(self, chat_id, thread_id):
         return self.history.setdefault(self.chat_key(chat_id, thread_id), [])
 
+    def next_session_num(self, chat_id):
+        n = self.session_count.get(chat_id, 0) + 1
+        self.session_count[chat_id] = n
+        return n
+
 
 # ---------------------------------------------------------------- commands
 
@@ -54,10 +69,15 @@ HELP = """<b>Keirai</b> - lightweight AI agent
 
 <b>Commands</b>
 /start, /help - this message
+/new [name] - start a new session (new topic when topics are on)
+/rename &lt;name&gt; - rename the current session/topic
 /test_md &lt;markdown&gt; - test markdown rendering pipeline
+/test_rich - test rich message rendering (tables, task lists, formulas)
 /thinking on|off - show/hide AI reasoning (default: %s)
 /models - list models from configured providers
 /model &lt;provider/model&gt; - switch model, e.g. /model go/glm-5.3-flash
+
+Each topic = one session with its own context. Enable topics for the bot via @BotFather to use sessions in this private chat.
 
 Send a photo to talk about it. Send media with caption <code>media_test</code> to test the media round-trip."""
 
@@ -81,6 +101,32 @@ def cmd_test_md(tg, msg, thread_id):
             tg.send(msg["chat"]["id"], part, thread_id)
     except Exception as e:
         _err(tg, msg, thread_id, "test_md failed: %s" % e)
+
+
+TEST_RICH_BODY = """# Rich message test
+
+Native **GFM table**:
+
+| Provider | Model | Context |
+|:---------|:-----:|--------:|
+| zen | glm-5.3-flash | 1,000,000 |
+| go | kimi-k3 | 1,048,576 |
+
+- [ ] task list item
+- [x] completed item
+- nested
+  - sub item
+
+Inline `code`, ==marked text==, ~~strike~~, ||spoiler|| and $$E = mc^2$$"""
+
+
+def cmd_test_rich(tg, msg, thread_id):
+    src = _arg(msg) or TEST_RICH_BODY
+    try:
+        for chunk in md2tg.split_rich(src):
+            tg.send_rich(msg["chat"]["id"], markdown=chunk, thread_id=thread_id)
+    except Exception as e:
+        _err(tg, msg, thread_id, "test_rich failed: %s" % e)
 
 
 def cmd_thinking(tg, msg, thread_id, state):
@@ -121,6 +167,89 @@ def cmd_model(cfg, tg, msg, thread_id, state):
         return
     state.model[state.chat_key(chat_id, thread_id)] = arg
     tg.send(chat_id, "model set to <code>%s</code>" % _esc(arg), thread_id)
+
+
+def cmd_new(cfg, tg, msg, thread_id, state):
+    """Start a new session: a fresh topic when topics are available,
+    otherwise reset the current (implicit) session."""
+    chat_id = msg["chat"]["id"]
+    name = _arg(msg).strip() or "Session %d" % state.next_session_num(chat_id)
+    if not state.topics_enabled:
+        state.history.pop(state.chat_key(chat_id, thread_id), None)
+        state.model.pop(state.chat_key(chat_id, thread_id), None)
+        tg.send(chat_id, "topics are not enabled for this bot - "
+                         "session cleared here instead. Enable topics via "
+                         "@BotFather to get one topic per session.", thread_id)
+        return
+    try:
+        topic = tg.create_topic(chat_id, name)
+    except Exception as e:
+        _err(tg, msg, thread_id, "could not create topic: %s" % e)
+        return
+    tid = topic["message_thread_id"]
+    state.topics.setdefault(chat_id, []).append(tid)
+    log.info("session created: chat=%s topic=%s name=%r", chat_id, tid, name)
+    tg.send(chat_id, "new session <b>%s</b> started - type here" % _esc(name), tid)
+
+
+def cmd_reset_all(cfg, tg, msg, thread_id, state):
+    """Wipe everything for this chat: all sessions, their context, and the
+    Telegram topics we created. Hidden from /help. Requires typing two
+    random confirmation strings."""
+    chat_id = msg["chat"]["id"]
+    args = _arg(msg).split()
+    pending = state.pending_reset.get(chat_id)
+    if pending and len(args) >= 2 and args[0] == pending[0] and args[1] == pending[1]:
+        deleted, failed = 0, 0
+        for tid in state.topics.get(chat_id, []):
+            try:
+                tg.delete_topic(chat_id, tid)
+                deleted += 1
+            except Exception as e:
+                failed += 1
+                log.warning("topic delete failed: chat=%s topic=%s: %s", chat_id, tid, e)
+        for key in [k for k in state.history if k[0] == chat_id]:
+            del state.history[key]
+        for key in [k for k in state.model if k[0] == chat_id]:
+            del state.model[key]
+        state.session_count.pop(chat_id, None)
+        state.topics.pop(chat_id, None)
+        state.pending_reset.pop(chat_id, None)
+        log.info("reset-all: chat=%s topics deleted=%d failed=%d", chat_id, deleted, failed)
+        tg.send(chat_id, "reset done - <b>%d</b> topic(s) deleted, all sessions cleared." % deleted, thread_id)
+        return
+    s1, s2 = _confirmation_pair(), _confirmation_pair()
+    state.pending_reset[chat_id] = (s1, s2)
+    log.info("reset-all initiated: chat=%s", chat_id)
+    tg.send(chat_id,
+            "<b>careful:</b> this deletes ALL sessions, their context and their "
+            "Telegram topics. This cannot be undone.\n\n"
+            "To confirm, send exactly:\n"
+            "<code>/reset-all %s %s</code>" % (s1, s2), thread_id)
+
+
+def _confirmation_pair():
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(4))
+
+
+def cmd_rename(cfg, tg, msg, thread_id, state):
+    """Rename the current topic/session."""
+    chat_id = msg["chat"]["id"]
+    name = _arg(msg).strip()
+    if not name:
+        tg.send(chat_id, "usage: /rename &lt;name&gt;", thread_id)
+        return
+    if thread_id is None:
+        tg.send(chat_id, "open (or create with /new) a topic first - there is "
+                         "nothing to rename in the main chat", thread_id)
+        return
+    try:
+        tg.edit_topic(chat_id, thread_id, name)
+    except Exception as e:
+        _err(tg, msg, thread_id, "could not rename topic: %s" % e)
+        return
+    tg.send(chat_id, "session renamed to <b>%s</b>" % _esc(name), thread_id)
 
 
 def _format_models(models):
@@ -168,9 +297,27 @@ def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     del history[:-HISTORY_LIMIT]
 
     show = state.thinking_on(msg["from"]["id"])
-    parts = md2tg.send_parts(answer, reasoning if show else None)
-    for i, part in enumerate(parts):
+    reasoning_md = reasoning if (show and reasoning and reasoning.strip()) else None
+    if cfg.rich_messages:
+        try:
+            _send_rich_answer(tg, msg["chat"]["id"], thread_id, answer, reasoning_md)
+            return
+        except tg_mod.TelegramError as e:
+            log.warning("rich send failed, falling back to regular messages: %s", e)
+    parts = md2tg.send_parts(answer, reasoning_md)
+    for part in parts:
         tg.send(msg["chat"]["id"], part, thread_id)
+
+
+def _send_rich_answer(tg, chat_id, thread_id, answer_md, thinking_md):
+    """Bot API 10.1 rich messages: answer as GFM markdown (native tables,
+    task lists, headings, 32k chars), thinking as a collapsible <details>."""
+    if thinking_md:
+        for chunk in md2tg.split(thinking_md, md2tg.RICH_LIMIT):
+            tg.send_rich(chat_id, html="<details><summary>\U0001f914 Thinking</summary>%s</details>" % chunk,
+                         thread_id=thread_id)
+    for chunk in md2tg.split_rich(answer_md):
+        tg.send_rich(chat_id, markdown=chunk, thread_id=thread_id)
 
 
 # ---------------------------------------------------------------- media
@@ -289,12 +436,20 @@ def handle_message(cfg, tg, msg, state):
             tg.send(chat_id, HELP % ("on" if state.thinking_on(user["id"]) else "off"), thread_id)
         elif cmd == "test_md":
             cmd_test_md(tg, msg, thread_id)
+        elif cmd == "test_rich":
+            cmd_test_rich(tg, msg, thread_id)
         elif cmd == "thinking":
             cmd_thinking(tg, msg, thread_id, state)
         elif cmd == "models":
             cmd_models(cfg, tg, msg, thread_id)
         elif cmd == "model":
             cmd_model(cfg, tg, msg, thread_id, state)
+        elif cmd == "new":
+            cmd_new(cfg, tg, msg, thread_id, state)
+        elif cmd == "rename":
+            cmd_rename(cfg, tg, msg, thread_id, state)
+        elif cmd == "reset-all":
+            cmd_reset_all(cfg, tg, msg, thread_id, state)
         else:
             tg.send(chat_id, "unknown command, try /help", thread_id)
         return
@@ -309,18 +464,47 @@ def handle_message(cfg, tg, msg, state):
 
 # ---------------------------------------------------------------- main
 
+def setup_logging(base_dir=None):
+    """Log to stderr AND to <base>/logs/keirai.log (rotating 2MB x 3)."""
+    base = base_dir or os.path.dirname(os.path.abspath(__file__))
+    logdir = os.path.join(base, "logs")
+    os.makedirs(logdir, exist_ok=True)
+    root = logging.getLogger("keirai")
+    if root.handlers:
+        return root
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    fh = logging.handlers.RotatingFileHandler(
+        os.path.join(logdir, "keirai.log"), maxBytes=2_000_000, backupCount=2,
+        encoding="utf-8")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    root.addHandler(fh)
+    root.addHandler(sh)
+    return root
+
+
 def main():
+    setup_logging()
     try:
         cfg = config_mod.load()
         cfg.validate()
     except config_mod.ConfigError as e:
-        print("config error: %s" % e, file=sys.stderr)
-        print("copy config.example.toml to config.toml and set bot_token", file=sys.stderr)
+        log.error("config error: %s", e)
+        log.error("copy config.example.toml to config.toml and set bot_token")
         sys.exit(1)
 
     tg = tg_mod.Telegram(cfg.bot_token)
     state = State(cfg.thinking_default)
-    print("keirai: polling... (default model: %s)" % cfg.default_model)
+    try:
+        me = tg.get_me()
+        state.topics_enabled = bool(me.get("has_topics_enabled"))
+        log.info("bot @%s ready (private-chat topics: %s)",
+                 me.get("username", "?"), "on" if state.topics_enabled else "off - enable via @BotFather")
+    except tg_mod.TelegramError as e:
+        log.error("getMe failed: %s (continuing without topic support)", e)
+    log.info("polling... (default model: %s)", cfg.default_model)
     offset = None
     backoff = 1
     while True:
@@ -328,7 +512,7 @@ def main():
             updates = tg.get_updates(offset)
             backoff = 1
         except tg_mod.TelegramError as e:
-            print("poll error: %s" % e, file=sys.stderr)
+            log.error("poll error: %s", e)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue
@@ -340,7 +524,7 @@ def main():
             try:
                 handle_message(cfg, tg, msg, state)
             except Exception as e:
-                print("handler error: %s" % e, file=sys.stderr)
+                log.exception("handler error")
                 try:
                     tg.send(msg["chat"]["id"], "error: %s" % _esc(str(e)), msg.get("message_thread_id"))
                 except Exception:
@@ -371,7 +555,7 @@ def _fmt_cost(x):
 
 
 def _err(tg, msg, thread_id, text):
-    print("error: %s" % text, file=sys.stderr)
+    log.error(text)
     try:
         tg.send(msg["chat"]["id"], "error: %s" % _esc(text), thread_id)
     except Exception:

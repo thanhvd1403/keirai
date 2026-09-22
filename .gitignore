@@ -3,4 +3,5 @@ __pycache__/
 config.json
 config.toml
 cache/
+logs/
 .venv/
