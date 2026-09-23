@@ -30,10 +30,11 @@ IMAGE_MIMES = ("image/jpeg", "image/png", "image/gif", "image/webp")
 
 
 class State:
-    """In-memory state (P0). Sessions persist in P1+."""
+    """Session state: in-memory + optional SQLite write-through persistence."""
 
-    def __init__(self, thinking_default):
+    def __init__(self, thinking_default, store=None):
         self._default = thinking_default
+        self.store = store
         self.topics_enabled = False  # bot has topic mode in private chats (getMe)
         self.session_count = {}  # chat_id -> int, for auto session names
         self.topics = {}         # chat_id -> [thread_id] of topics we created
@@ -41,6 +42,27 @@ class State:
         self.thinking = {}   # user_id -> bool
         self.model = {}      # (chat_id, thread) -> "provider/model"
         self.history = {}    # (chat_id, thread) -> [messages]
+        if store:
+            self._load()
+
+    def _load(self):
+        for chat_id, thread_id, model, messages, _updated in self.store.load_sessions():
+            key = (chat_id, None if thread_id == 0 else thread_id)
+            self.history[key] = messages
+            if model:
+                self.model[key] = model
+        for chat_id, thread_id, name in self.store.load_topics():
+            self.topics.setdefault(chat_id, []).append(thread_id)
+        for chat_id, tids in self.topics.items():
+            self.session_count[chat_id] = len(tids) + 1
+
+    def persist(self, chat_id, thread_id):
+        """Write current session (history + model) through to the store."""
+        if not self.store:
+            return
+        key = self.chat_key(chat_id, thread_id)
+        self.store.save_session(chat_id, thread_id or 0, self.model.get(key),
+                                self.history.get(key) or [])
 
     def thinking_on(self, user_id):
         return self.thinking.get(user_id, self._default)
@@ -64,22 +86,40 @@ class State:
 
 
 # ---------------------------------------------------------------- commands
+# Command registry: name -> (handler, help_text, hidden)
+# handler signature: fn(cfg, tg, msg, thread_id, state)
 
-HELP = """<b>Keirai</b> - lightweight AI agent
+COMMANDS = {}
 
-<b>Commands</b>
-/start, /help - this message
-/new [name] - start a new session (new topic when topics are on)
-/rename &lt;name&gt; - rename the current session/topic
-/test_md &lt;markdown&gt; - test markdown rendering pipeline
-/test_rich - test rich message rendering (tables, task lists, formulas)
-/thinking on|off - show/hide AI reasoning (default: %s)
-/models - list models from configured providers
-/model &lt;provider/model&gt; - switch model, e.g. /model go/glm-5.3-flash
 
-Each topic = one session with its own context. Enable topics for the bot via @BotFather to use sessions in this private chat.
+def command(name, help_text, hidden=False):
+    def deco(fn):
+        COMMANDS[name] = (fn, help_text, hidden)
+        return fn
+    return deco
 
-Send a photo to talk about it. Send media with caption <code>media_test</code> to test the media round-trip."""
+
+def build_help():
+    lines = ["<b>Keirai</b> - lightweight AI agent", "", "<b>Commands</b>"]
+    for name in sorted(COMMANDS):
+        fn, desc, hidden = COMMANDS[name]
+        if not hidden:
+            lines.append("/%s - %s" % (name, desc))
+    lines += [
+        "",
+        "Each topic = one session with its own context. Enable topics for the bot "
+        "via @BotFather to use sessions in this private chat.",
+        "",
+        "Send a photo to talk about it. Send media with caption <code>media_test</code> "
+        "to test the media round-trip.",
+    ]
+    return "\n".join(lines)
+
+
+@command("start", "this message")
+@command("help", "this message")
+def cmd_start(cfg, tg, msg, thread_id, state):
+    tg.send(msg["chat"]["id"], build_help(), thread_id)
 
 TEST_MD_BODY = """**bold** *italic* ~~strike~~ ||spoiler|| `inline code`
 # Header
@@ -94,7 +134,8 @@ def hi():
 snake_case and file_name.txt stay literal"""
 
 
-def cmd_test_md(tg, msg, thread_id):
+@command("test_md", "run markdown through the regular rendering pipeline (arg optional)")
+def cmd_test_md(cfg, tg, msg, thread_id, state):
     src = _arg(msg) or TEST_MD_BODY
     try:
         for part in md2tg.split(src):
@@ -120,7 +161,8 @@ Native **GFM table**:
 Inline `code`, ==marked text==, ~~strike~~, ||spoiler|| and $$E = mc^2$$"""
 
 
-def cmd_test_rich(tg, msg, thread_id):
+@command("test_rich", "test rich message rendering (tables, task lists, formulas)")
+def cmd_test_rich(cfg, tg, msg, thread_id, state):
     src = _arg(msg) or TEST_RICH_BODY
     try:
         for chunk in md2tg.split_rich(src):
@@ -129,7 +171,8 @@ def cmd_test_rich(tg, msg, thread_id):
         _err(tg, msg, thread_id, "test_rich failed: %s" % e)
 
 
-def cmd_thinking(tg, msg, thread_id, state):
+@command("thinking", "show/hide AI reasoning: /thinking on|off")
+def cmd_thinking(cfg, tg, msg, thread_id, state):
     arg = _arg(msg).strip().lower()
     user_id = msg["from"]["id"]
     if arg in ("on", "off"):
@@ -137,7 +180,8 @@ def cmd_thinking(tg, msg, thread_id, state):
     tg.send(msg["chat"]["id"], "thinking is <b>%s</b>" % ("on" if state.thinking_on(user_id) else "off"), thread_id)
 
 
-def cmd_models(cfg, tg, msg, thread_id):
+@command("models", "list models from configured providers (with context/cost stats)")
+def cmd_models(cfg, tg, msg, thread_id, state):
     lines = []
     for name in ("zen", "go"):
         key = cfg.provider_key(name)
@@ -155,6 +199,7 @@ def cmd_models(cfg, tg, msg, thread_id):
         tg.send(msg["chat"]["id"], part, thread_id)
 
 
+@command("model", "switch model: /model provider/model-id, e.g. /model go/glm-5.3-flash")
 def cmd_model(cfg, tg, msg, thread_id, state):
     arg = _arg(msg).strip()
     chat_id = msg["chat"]["id"]
@@ -166,9 +211,11 @@ def cmd_model(cfg, tg, msg, thread_id, state):
         tg.send(chat_id, "model must look like <code>zen/&lt;model-id&gt;</code> or <code>go/&lt;model-id&gt;</code>", thread_id)
         return
     state.model[state.chat_key(chat_id, thread_id)] = arg
+    state.persist(chat_id, thread_id)
     tg.send(chat_id, "model set to <code>%s</code>" % _esc(arg), thread_id)
 
 
+@command("new", "start a new session (new topic when topics are on): /new [name]")
 def cmd_new(cfg, tg, msg, thread_id, state):
     """Start a new session: a fresh topic when topics are available,
     otherwise reset the current (implicit) session."""
@@ -188,10 +235,13 @@ def cmd_new(cfg, tg, msg, thread_id, state):
         return
     tid = topic["message_thread_id"]
     state.topics.setdefault(chat_id, []).append(tid)
+    if state.store:
+        state.store.add_topic(chat_id, tid, name)
     log.info("session created: chat=%s topic=%s name=%r", chat_id, tid, name)
     tg.send(chat_id, "new session <b>%s</b> started - type here" % _esc(name), tid)
 
 
+@command("reset-all", "wipe every session and delete the bot's topics", hidden=True)
 def cmd_reset_all(cfg, tg, msg, thread_id, state):
     """Wipe everything for this chat: all sessions, their context, and the
     Telegram topics we created. Hidden from /help. Requires typing two
@@ -215,6 +265,8 @@ def cmd_reset_all(cfg, tg, msg, thread_id, state):
         state.session_count.pop(chat_id, None)
         state.topics.pop(chat_id, None)
         state.pending_reset.pop(chat_id, None)
+        if state.store:
+            state.store.delete_chat(chat_id)
         log.info("reset-all: chat=%s topics deleted=%d failed=%d", chat_id, deleted, failed)
         tg.send(chat_id, "reset done - <b>%d</b> topic(s) deleted, all sessions cleared." % deleted, thread_id)
         return
@@ -233,6 +285,7 @@ def _confirmation_pair():
     return "".join(secrets.choice(alphabet) for _ in range(4))
 
 
+@command("rename", "rename the current session/topic: /rename <name>")
 def cmd_rename(cfg, tg, msg, thread_id, state):
     """Rename the current topic/session."""
     chat_id = msg["chat"]["id"]
@@ -249,7 +302,53 @@ def cmd_rename(cfg, tg, msg, thread_id, state):
     except Exception as e:
         _err(tg, msg, thread_id, "could not rename topic: %s" % e)
         return
+    if state.store:
+        state.store.set_topic_name(chat_id, thread_id, name)
     tg.send(chat_id, "session renamed to <b>%s</b>" % _esc(name), thread_id)
+
+
+@command("delete", "delete this session's context (topic stays; delete it manually)")
+def cmd_delete(cfg, tg, msg, thread_id, state):
+    """Clear the conversation context of the current session. The Telegram
+    topic is NOT deleted - only the memory of the conversation."""
+    chat_id = msg["chat"]["id"]
+    key = state.chat_key(chat_id, thread_id)
+    had = bool(state.history.get(key))
+    state.history.pop(key, None)
+    state.model.pop(key, None)
+    if state.store:
+        state.store.delete_session(chat_id, thread_id or 0)
+    log.info("session deleted: chat=%s thread=%s (had_history=%s)", chat_id, thread_id, had)
+    tg.send(chat_id, "session deleted - conversation context cleared."
+            "\nthe topic itself stays; you can delete it manually in Telegram.",
+            thread_id)
+
+
+@command("compact", "summarize older context now to free space (also runs automatically)")
+def cmd_compact(cfg, tg, msg, thread_id, state):
+    chat_id = msg["chat"]["id"]
+    history = state.get_history(chat_id, thread_id)
+    if len(history) < 5:
+        tg.send(chat_id, "nothing to compact yet (%d messages)" % len(history), thread_id)
+        return
+    model_full = state.model_for(chat_id, thread_id, cfg.default_model)
+    provider, api_key, model_id = _resolve_provider(cfg, model_full)
+    if not api_key:
+        _err(tg, msg, thread_id, "no API key for provider '%s'" % provider)
+        return
+    tg.typing(chat_id, thread_id)
+    before_n, before_chars = len(history), _est_chars(history)
+    try:
+        history[:] = _compact(cfg, provider, api_key, model_id, history,
+                              "compact-%s-%s" % (chat_id, thread_id or "main"))
+    except Exception as e:
+        _err(tg, msg, thread_id, "compaction failed: %s" % e)
+        return
+    state.persist(chat_id, thread_id)
+    log.info("manual compact: chat=%s thread=%s %d->%d msgs", chat_id, thread_id,
+             before_n, len(history))
+    tg.send(chat_id, "compacted: %d -> %d messages (%d -> %d chars)"
+            % (before_n, len(history), before_chars, _est_chars(history)), thread_id)
 
 
 def _format_models(models):
@@ -268,22 +367,106 @@ def _format_models(models):
 
 # ---------------------------------------------------------------- AI chat
 
-def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
-    model_full = state.model_for(msg["chat"]["id"], thread_id, cfg.default_model)
+def _resolve_provider(cfg, model_full):
+    """(provider_name, api_key, model_id) - falls back to the other provider
+    (prefer go) when the configured one has no key; keys are endpoint-bound."""
     provider_name, model_id = model_full.split("/", 1)
     api_key = cfg.provider_key(provider_name)
     if not api_key:
-        # fall back to the other provider (prefer go), keys are endpoint-bound
         alt = "go" if provider_name != "go" else "zen"
         alt_key = cfg.provider_key(alt)
         if alt_key:
             log.info("no API key for provider '%s' - routing model '%s' via '%s'",
                      provider_name, model_id, alt)
-            provider_name, api_key = alt, alt_key
+            return alt, alt_key, model_id
+    return provider_name, api_key, model_id
+
+
+def _est_chars(history):
+    n = 0
+    for m in history:
+        c = m.get("content")
+        if isinstance(c, str):
+            n += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    n += len(part.get("text", ""))
+    return n
+
+
+def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4):
+    """Summarize the older part of history, keep the last `keep` messages.
+    Returns the new message list."""
+    tail = list(history[-keep:]) if len(history) > keep else list(history)
+    older = history[:-keep] if len(history) > keep else []
+    if not older:
+        return history
+    transcript = []
+    for m in older:
+        role = m.get("role", "?")
+        c = m.get("content")
+        if isinstance(c, list):
+            c = " ".join(p.get("text", "") for p in c if isinstance(p, dict)
+                         and p.get("type") == "text")
+        transcript.append("%s: %s" % (role, (c or "")[:4000]))
+    prompt = ("Summarize this earlier conversation concisely in markdown "
+              "(facts, decisions, open tasks, user preferences), under 400 words:\n\n"
+              + "\n".join(transcript))
+    summary, _ = providers.chat(provider, api_key, model_id,
+                                [{"role": "user", "content": prompt}],
+                                session_id=session_id)
+    marker = [
+        {"role": "user", "content": "[Summary of earlier conversation]\n" + summary},
+        {"role": "assistant", "content": "Understood. Continuing with that context."},
+    ]
+    return marker + tail
+
+
+def _stream_answer(tg, cfg, msg, thread_id, provider, api_key, model_id,
+                   messages, session_id):
+    """Stream the completion, showing live drafts in private chats.
+    Returns (answer, reasoning). Raises on provider failure."""
+    draft_id = secrets.randbelow(10**9) + 1
+    answer, reasoning = "", ""
+    show_reasoning = True  # until first content token arrives
+    drafts_on = True
+    last_flush = 0.0
+    for kind, delta in providers.chat_stream(provider, api_key, model_id, messages,
+                                             session_id=session_id):
+        if kind == "reasoning" and show_reasoning:
+            reasoning += delta
+        else:
+            show_reasoning = False
+            answer += delta
+        now = time.time()
+        if drafts_on and now - last_flush > 1.5:
+            last_flush = now
+            try:
+                if show_reasoning and reasoning:
+                    tg.send_rich_draft(
+                        msg["chat"]["id"], draft_id,
+                        html="<tg-thinking>%s</tg-thinking>" % _esc(reasoning[-2000:]),
+                        thread_id=thread_id)
+                elif answer and len(answer) <= md2tg.RICH_LIMIT:
+                    tg.send_rich_draft(msg["chat"]["id"], draft_id,
+                                       markdown=answer, thread_id=thread_id)
+            except tg_mod.TelegramError as e:
+                log.warning("draft updates disabled: %s", e)
+                drafts_on = False
+    if not answer.strip():
+        raise providers.ProviderError("empty answer from stream")
+    return answer, reasoning
+
+
+def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
+    model_full = state.model_for(msg["chat"]["id"], thread_id, cfg.default_model)
+    provider_name, api_key, model_id = _resolve_provider(cfg, model_full)
     if not api_key:
         _err(tg, msg, thread_id, "no API key for provider '%s' (or fallback 'go'/'zen')"
              % provider_name)
         return
+    session_id = "keirai-%s-%s" % (msg["chat"]["id"], thread_id or "main")
 
     content = [{"type": "text", "text": text or "Describe the image."}]
     for mime, b64 in images or []:
@@ -292,20 +475,46 @@ def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
 
     history = state.get_history(msg["chat"]["id"], thread_id)
     history.append(user_msg)
+
+    # auto-compact before the context limit is hit
+    if _est_chars(history) > cfg.context_limit_chars and len(history) > 6:
+        before = len(history)
+        try:
+            history[:] = _compact(cfg, provider_name, api_key, model_id, history,
+                                  session_id)
+            log.info("auto-compact: chat=%s thread=%s %d -> %d msgs",
+                     msg["chat"]["id"], thread_id, before, len(history))
+        except Exception as e:
+            log.warning("auto-compact failed (%s) - trimming oldest instead", e)
+            del history[:-6]
+
     messages = ([{"role": "system", "content": cfg.system_prompt}] if cfg.system_prompt else []) + history[-HISTORY_LIMIT:]
 
-    tg.typing(msg["chat"]["id"], thread_id)
-    try:
-        session_id = "keirai-%s-%s" % (msg["chat"]["id"], thread_id or "main")
-        answer, reasoning = providers.chat(provider_name, api_key, model_id, messages,
-                                           session_id=session_id)
-    except Exception as e:
-        history.pop()  # don't keep failed turns
-        _err(tg, msg, thread_id, "%s error: %s" % (provider_name, e))
-        return
+    reasoning = None
+    answer = None
+    can_stream = (cfg.rich_messages and cfg.stream_drafts
+                  and msg["chat"].get("type") == "private")
+    if can_stream:
+        try:
+            answer, reasoning = _stream_answer(tg, cfg, msg, thread_id,
+                                               provider_name, api_key, model_id,
+                                               messages, session_id)
+        except Exception as e:
+            log.warning("streaming failed (%s) - falling back to blocking call", e)
+    if answer is None:
+        tg.typing(msg["chat"]["id"], thread_id)
+        try:
+            answer, reasoning = providers.chat(provider_name, api_key, model_id,
+                                               messages, session_id=session_id)
+        except Exception as e:
+            history.pop()  # don't keep failed turns
+            state.persist(msg["chat"]["id"], thread_id)
+            _err(tg, msg, thread_id, "%s error: %s" % (provider_name, e))
+            return
 
     history.append({"role": "assistant", "content": answer})
     del history[:-HISTORY_LIMIT]
+    state.persist(msg["chat"]["id"], thread_id)
 
     show = state.thinking_on(msg["from"]["id"])
     reasoning_md = reasoning if (show and reasoning and reasoning.strip()) else None
@@ -447,26 +656,11 @@ def handle_message(cfg, tg, msg, state):
     if text.startswith("/"):
         cmd, _, rest = text[1:].partition(" ")
         msg["_arg"] = rest
-        if cmd in ("start", "help"):
-            tg.send(chat_id, HELP % ("on" if state.thinking_on(user["id"]) else "off"), thread_id)
-        elif cmd == "test_md":
-            cmd_test_md(tg, msg, thread_id)
-        elif cmd == "test_rich":
-            cmd_test_rich(tg, msg, thread_id)
-        elif cmd == "thinking":
-            cmd_thinking(tg, msg, thread_id, state)
-        elif cmd == "models":
-            cmd_models(cfg, tg, msg, thread_id)
-        elif cmd == "model":
-            cmd_model(cfg, tg, msg, thread_id, state)
-        elif cmd == "new":
-            cmd_new(cfg, tg, msg, thread_id, state)
-        elif cmd == "rename":
-            cmd_rename(cfg, tg, msg, thread_id, state)
-        elif cmd == "reset-all":
-            cmd_reset_all(cfg, tg, msg, thread_id, state)
-        else:
+        entry = COMMANDS.get(cmd.split("@", 1)[0])  # tolerate /cmd@botname
+        if entry is None:
             tg.send(chat_id, "unknown command, try /help", thread_id)
+        else:
+            entry[0](cfg, tg, msg, thread_id, state)
         return
 
     if msg.get("photo") or msg.get("document") or msg.get("video") or msg.get("voice") or msg.get("audio"):
@@ -510,8 +704,10 @@ def main():
         log.error("copy config.example.toml to config.toml and set bot_token")
         sys.exit(1)
 
+    import sessions
+    store = sessions.Store(config_mod.sessions_path(cfg))
     tg = tg_mod.Telegram(cfg.bot_token)
-    state = State(cfg.thinking_default)
+    state = State(cfg.thinking_default, store=store)
     try:
         me = tg.get_me()
         state.topics_enabled = bool(me.get("has_topics_enabled"))
@@ -519,6 +715,13 @@ def main():
                  me.get("username", "?"), "on" if state.topics_enabled else "off - enable via @BotFather")
     except tg_mod.TelegramError as e:
         log.error("getMe failed: %s (continuing without topic support)", e)
+    try:
+        tg.call("setMyCommands", {"commands": [
+            {"command": name, "description": desc}
+            for name, (fn, desc, hidden) in sorted(COMMANDS.items()) if not hidden
+        ]})
+    except tg_mod.TelegramError as e:
+        log.warning("setMyCommands failed: %s", e)
     log.info("polling... (default model: %s)", cfg.default_model)
     offset = None
     backoff = 1

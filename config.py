@@ -35,6 +35,8 @@ class Config:
             self.allowed_users = []
         self.thinking_default = bool(data.get("thinking_default", True))
         self.rich_messages = bool(data.get("rich_messages", True))
+        self.stream_drafts = bool(data.get("stream_drafts", True))
+        self.context_limit_chars = int(data.get("context_limit_chars", 120_000))
         self.default_model = data.get("default_model", "zen/glm-5.3-flash")
         self.max_file_mb = int(data.get("max_file_mb", 20))
         self.system_prompt = data.get("system_prompt", "You are Keirai, a lightweight AI agent.")
@@ -92,3 +94,9 @@ def cache_dir(config):
     d = os.path.join(base, "cache")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def sessions_path(config):
+    """SQLite session db path next to the config file (or ./sessions.db)."""
+    base = os.path.dirname(os.path.abspath(config.path)) if config.path else os.getcwd()
+    return os.path.join(base, "sessions.db")

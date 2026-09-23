@@ -62,8 +62,12 @@
   - `rich_messages` config kill-switch (default on); automatic fallback to regular messages on TelegramError
 - [x] Thinking display as native collapsible `<details><summary>` block (rich HTML path, converted via our md2tg)
 - [x] `/test_rich` command + regular-message fallback kept for old paths (`/test_md`)
-- [ ] Streaming drafts: `sendRichMessageDraft` + `<tg-thinking>` placeholder while generating (needs provider streaming first)
-- [ ] Explore: `<mark>`, footnotes, media blocks in answers, `editMessageText(rich_message=...)` for live edits
+- [x] Streaming drafts: `sendRichMessageDraft` (private chats) while generating
+  - Reasoning shown live as `<tg-thinking>` placeholder, then answer markdown streamed (first flush immediate, then every 1.5s)
+  - Final `sendRichMessage` persists the message (draft is ephemeral, ~30s)
+  - `stream_drafts` config toggle; automatic fallback to blocking call on any error
+- [x] `==marked==`, footnotes, `$$formulas$$`, inline HTML - work automatically via GFM markdown passthrough
+- [ ] Media blocks in answers (rich media needs HTTP URLs) and `editMessageText(rich_message=...)` for live edits after send
 
 ## P1 - Session Management & Context Control
 
@@ -75,28 +79,28 @@
 - [x] Create sessions: `/new [name]` creates a new topic + fresh session (auto-names "Session N" without arg)
 - [x] Rename sessions: `/rename <name>` renames the current topic/session
 - [x] Keep context strictly isolated per topic (history + model choice keyed by (chat, thread))
-- [ ] Storage for session context (in-memory first; SQLite/files when CLI management needs it)
+- [x] Storage for session context: SQLite `sessions.db` (stdlib sqlite3) - history, model choice and topic registry
+  - Write-through after every turn, loaded on startup - sessions survive restarts and are CLI-manageable
 
 ### 10. /delete command
-- [ ] `/delete` clears the current session's context (the conversation memory)
-- [ ] Do NOT delete the Telegram topic - send a confirmation that the session is deleted and note the user can delete the topic manually
+- [x] `/delete` clears the current session's context (the conversation memory) and its db row
+- [x] Do NOT delete the Telegram topic - send a confirmation that the session is deleted and note the user can delete the topic manually
 
 ### 11. Context window management
-- [ ] Configurable limit for context size (metric TBD: chars or tokens)
-- [ ] `/compact` slash command: manually compact the current session's context
-- [ ] Auto-compact when context exceeds the configured limit
-- [ ] Compaction strategy (TBD): summarize older messages, keep recent ones
+- [x] Configurable limit for context size: `context_limit_chars` (chars; default 120000 ~ 30k tokens - no tokenizer dependency)
+- [x] `/compact` slash command: manually compact the current session's context (reports before/after sizes)
+- [x] Auto-compact when context exceeds the configured limit (falls back to trimming oldest on failure)
+- [x] Compaction strategy: summarize older messages via the provider into a `[Summary of earlier conversation]` marker message, keep the last 4 messages
 
 ### 12. CLI fallback for session management
-- [ ] Simple CLI entry point to manage sessions without Telegram (e.g. admin/recovery when bot is down)
-- [ ] List sessions (id, name, size, last active)
-- [ ] Rename sessions
-- [ ] Delete sessions
+- [x] `python cli.py list|delete|rename` - works without Telegram, operates directly on sessions.db
+- [x] List sessions (chat, thread, name, message count, model, last active)
+- [x] Rename sessions (stored session/topic name)
+- [x] Delete sessions (context only; prints a hint that the Telegram topic is untouched)
 
 ### 13. /help command listing
-- [ ] `/help` lists all available commands dynamically (so far)
-  - Build the list from registered command handlers, not a hardcoded string - new commands appear automatically
-- [ ] Register commands with Telegram's `setMyCommands` so they show up in the bot's UI menu
+- [x] `/help` lists all available commands dynamically - built from the COMMANDS registry, hidden commands excluded
+- [x] Register commands with `setMyCommands` at startup so they show up in the bot's UI menu
 
 ## P2 - Core Tools & Message Context
 

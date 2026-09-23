@@ -27,37 +27,45 @@ keirai/
 ├── AGENTS.md            # This file - project goals and rules
 ├── TODO.md              # Planned features
 ├── LICENSE              # AGPLv3
-├── .gitignore           # Ignores config.json (secrets), cache/, __pycache__
-├── main.py              # Entry point: polling loop, commands, routing
-├── config.py            # Config loading (JSON + env overrides)
-├── telegram.py          # Telegram Bot API client (raw HTTP, multipart)
+├── .gitignore           # Ignores config.toml (secrets), sessions.db, cache/, logs/, __pycache__
+├── main.py              # Entry point: polling loop, commands, routing, streaming
+├── config.py            # Config loading (TOML + env overrides)
+├── telegram.py          # Telegram Bot API client (raw HTTP, multipart, rich messages)
 ├── md2tg.py             # Markdown -> Telegram HTML, message splitting
-├── providers.py         # OpenCode Zen/Go clients, model stats cache
+├── providers.py         # OpenCode Zen/Go clients (blocking + streaming), model stats cache
+├── sessions.py          # SQLite session store (history, models, topics)
+├── cli.py               # Session management CLI (list/delete/rename, no Telegram needed)
+├── deploy/keirai.service# systemd unit (keep-alive + autostart)
 ├── config.example.toml  # Config template (TOML, comments allowed)
 └── tests/               # Unit tests (unittest, stdlib)
-    ├── test_md2tg.py    #   markdown conversion + splitting
+    ├── test_md2tg.py    #   markdown conversion, splitting, rich split, tables, lists
     ├── test_config.py   #   config loading, access control
-    ├── test_providers.py#   provider parsing, cache, multipart
-    └── test_main.py     #   routing, commands, AI flow (offline, faked)
+    ├── test_providers.py#   provider parsing, cache, multipart, session header
+    └── test_main.py     #   routing, commands, sessions, streaming, compaction, CLI
 ```
 
 Run tests: `python -m unittest discover -s tests`
 
 ## Current Status
 
-P0 complete and tested (78 tests). The bot does:
+P0 + P1 complete and tested (102 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
-- AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), in-memory history per chat
+- AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
 - Sessions via Telegram topics (Bot API 9.3 private-chat topics, needs @BotFather toggle): `/new [name]`, `/rename <name>`, per-topic context isolation; `/reset-all` wipes everything (2-string confirmation, deletes tracked topics)
 - AI answers sent as Bot API 10.1 Rich Messages: markdown passthrough (native tables, task lists, headings, formulas, 32k chars), thinking as collapsible `<details>`; `rich_messages` config toggle + automatic fallback to regular messages
+- Live streaming in private chats via `sendRichMessageDraft` (reasoning as `<tg-thinking>`, then answer tokens; `stream_drafts` toggle, falls back to blocking)
+- Session persistence in SQLite (`sessions.db`): history, per-session model, topic registry - survives restarts; `/delete` clears one session's context
+- Context window management: `context_limit_chars` limit, `/compact` manual + auto-compact (summarize older messages, keep last 4)
+- CLI: `python cli.py list|delete|rename` for session admin without Telegram
+- Dynamic `/help` built from the command registry; commands registered with `setMyCommands`; OpenCode Go session header (`x-opencode-session`) + `keirai/0.1` user agent
 - Regular-message fallback path: Markdown -> Telegram HTML rendering with 4096-char splitting (never breaks code blocks; tables as aligned `<pre>`, nested list bullets)
 - `/test_md` (regular pipeline) and `/test_rich` (rich pipeline) for live rendering verification
 - `/models` lists models with auto-fetched stats (context window, costs) from provider APIs, cached on disk; `/model provider/id` switches models
 - Photos -> vision models; media round-trip test via caption `media_test`
 - Logging: stderr + `logs/keirai.log` (rotating)
 
-Not implemented yet: context compaction, session persistence, tools (P1+ - see TODO.md).
+Not implemented yet: P2 (tools: file/shell, web search, browser, reply-to context) and P3 - see TODO.md.
 
 ## License
 

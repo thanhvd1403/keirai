@@ -84,6 +84,15 @@ class Telegram:
             payload["message_thread_id"] = thread_id
         return self.call("sendRichMessage", payload, timeout=60)
 
+    def send_rich_draft(self, chat_id, draft_id, markdown=None, html=None, thread_id=None):
+        """Bot API 10.1 streaming draft: ephemeral ~30s preview, private chats
+        only. Reusing draft_id animates updates. Finalize with send_rich."""
+        rich = {"markdown": markdown} if markdown is not None else {"html": html}
+        payload = {"chat_id": chat_id, "draft_id": draft_id, "rich_message": rich}
+        if thread_id:
+            payload["message_thread_id"] = thread_id
+        return self.call("sendRichMessageDraft", payload, timeout=30)
+
     def typing(self, chat_id, thread_id=None):
         payload = {"chat_id": chat_id, "action": "typing"}
         if thread_id:

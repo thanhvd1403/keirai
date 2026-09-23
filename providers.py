@@ -173,5 +173,53 @@ def chat(name, api_key, model, messages, extra=None, session_id=None):
     return content, reasoning
 
 
+def chat_stream(name, api_key, model, messages, session_id=None):
+    """Streaming chat completion. Yields ("reasoning"|"content", delta_text).
+
+    OpenAI-compatible SSE (stream: true). Raises ProviderError on failure.
+    """
+    base = PROVIDER_BASES.get(name)
+    if not base:
+        raise ProviderError("unknown provider: %s" % name)
+    payload = {"model": model, "messages": messages, "stream": True}
+    headers = {"Authorization": "Bearer %s" % api_key, "User-Agent": "keirai/0.1",
+               "Content-Type": "application/json", "Accept": "text/event-stream"}
+    if session_id:
+        headers["x-opencode-session"] = session_id
+    req = urllib.request.Request(base + "/chat/completions",
+                                 data=json.dumps(payload).encode("utf-8"), headers=headers)
+    try:
+        resp = urllib.request.urlopen(req, timeout=CHAT_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        raise ProviderError("HTTP %d from %s: %s" % (e.code, base, body[:300]))
+    except urllib.error.URLError as e:
+        raise ProviderError("%s: %s" % (base, e.reason))
+    with resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except ValueError:
+                continue
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if isinstance(reasoning, dict):
+                reasoning = reasoning.get("content")
+            if reasoning:
+                yield "reasoning", reasoning
+            content = delta.get("content")
+            if content:
+                yield "content", content
+
+
 def image_part(mime, data_b64):
     return {"type": "image_url", "image_url": {"url": "data:%s;base64,%s" % (mime, data_b64)}}
