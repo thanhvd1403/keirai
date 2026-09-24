@@ -4,19 +4,23 @@ Stdlib only. Run: python main.py  (config from ./config.toml or KEIRAI_CONFIG)
 """
 import base64
 import html
+import json
 import logging
 import logging.handlers
 import mimetypes
 import os
+import queue
 import secrets
 import string
 import sys
+import threading
 import time
 
 import config as config_mod
 import md2tg
 import providers
 import telegram as tg_mod
+import tools as tools_mod
 
 log = logging.getLogger("keirai")
 
@@ -42,8 +46,34 @@ class State:
         self.thinking = {}   # user_id -> bool
         self.model = {}      # (chat_id, thread) -> "provider/model"
         self.history = {}    # (chat_id, thread) -> [messages]
+        self._turn_lock = threading.Lock()
+        self.active_turns = {}   # chat_key -> True while a reply/tool turn runs
+        self.interrupts = set()  # chat_keys the user asked to /stop
         if store:
             self._load()
+
+    # ------------------------------------------------ /stop bookkeeping
+    def begin_turn(self, key):
+        with self._turn_lock:
+            self.active_turns[key] = True
+            self.interrupts.discard(key)
+
+    def end_turn(self, key):
+        with self._turn_lock:
+            self.active_turns.pop(key, None)
+            self.interrupts.discard(key)
+
+    def request_interrupt(self, key):
+        """Flag a running turn to stop. True if one was running for `key`."""
+        with self._turn_lock:
+            if key in self.active_turns:
+                self.interrupts.add(key)
+                return True
+            return False
+
+    def interrupted(self, key):
+        with self._turn_lock:
+            return key in self.interrupts
 
     def _load(self):
         for chat_id, thread_id, model, messages, _updated in self.store.load_sessions():
@@ -112,6 +142,10 @@ def build_help():
         "",
         "Send a photo to talk about it. Send media with caption <code>media_test</code> "
         "to test the media round-trip.",
+        "",
+        "The agent can use tools: files, shell, web search/fetch - and a headless "
+        "browser once <code>deploy/install_lightpanda.sh</code> has been run.",
+        "While a reply or tool is running, /stop interrupts it.",
     ]
     return "\n".join(lines)
 
@@ -158,7 +192,10 @@ Native **GFM table**:
 - nested
   - sub item
 
-Inline `code`, ==marked text==, ~~strike~~, ||spoiler|| and $$E = mc^2$$"""
+Inline `code`, ==marked text==, ~~strike~~, ||spoiler|| and $$E = mc^2$$
+
+Media block (rich path renders it natively):
+![Keirai](https://raw.githubusercontent.com/thanhvd1403/keirai/main/LICENSE)"""
 
 
 @command("test_rich", "test rich message rendering (tables, task lists, formulas)")
@@ -324,6 +361,13 @@ def cmd_delete(cfg, tg, msg, thread_id, state):
             thread_id)
 
 
+@command("stop", "interrupt the reply/tool currently running in this chat")
+def cmd_stop(cfg, tg, msg, thread_id, state):
+    """Reaches the main loop only when no turn is running - the watcher
+    consumes /stop during an active turn and interrupts it directly."""
+    tg.send(msg["chat"]["id"], "nothing is running right now", thread_id)
+
+
 @command("compact", "summarize older context now to free space (also runs automatically)")
 def cmd_compact(cfg, tg, msg, thread_id, state):
     chat_id = msg["chat"]["id"]
@@ -413,9 +457,9 @@ def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4):
     prompt = ("Summarize this earlier conversation concisely in markdown "
               "(facts, decisions, open tasks, user preferences), under 400 words:\n\n"
               + "\n".join(transcript))
-    summary, _ = providers.chat(provider, api_key, model_id,
-                                [{"role": "user", "content": prompt}],
-                                session_id=session_id)
+    summary, _reasoning, _tcs = providers.chat(provider, api_key, model_id,
+                                               [{"role": "user", "content": prompt}],
+                                               session_id=session_id)
     marker = [
         {"role": "user", "content": "[Summary of earlier conversation]\n" + summary},
         {"role": "assistant", "content": "Understood. Continuing with that context."},
@@ -423,121 +467,270 @@ def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4):
     return marker + tail
 
 
-def _stream_answer(tg, cfg, msg, thread_id, provider, api_key, model_id,
-                   messages, session_id):
-    """Stream the completion, showing live drafts in private chats.
-    Returns (answer, reasoning). Raises on provider failure."""
-    draft_id = secrets.randbelow(10**9) + 1
+def _flush_live(tg, live, chat_id, thread_id, reasoning, answer, show_reasoning):
+    """Push current partial state to Telegram: drafts in private chats,
+    send/edit of a placeholder message elsewhere (live edits)."""
+    if show_reasoning and reasoning:
+        if live["mode"] == "draft":
+            tg.send_rich_draft(
+                chat_id, live["draft_id"],
+                html="<tg-thinking>%s</tg-thinking>" % _esc(reasoning[-2000:]),
+                thread_id=thread_id)
+        else:
+            # tg-thinking is draft-only -> collapsible <details> placeholder
+            src = ("<details><summary>\U0001f914 Thinking</summary>%s</details>"
+                   % _esc(reasoning[-2000:]))
+            if live.get("msg_id"):
+                tg.edit_rich(chat_id, live["msg_id"], html=src)
+            else:
+                live["msg_id"] = tg.send_rich(chat_id, html=src,
+                                              thread_id=thread_id)["message_id"]
+    elif answer and len(answer) <= md2tg.RICH_LIMIT:
+        if live["mode"] == "draft":
+            tg.send_rich_draft(chat_id, live["draft_id"], markdown=answer,
+                               thread_id=thread_id)
+        elif live.get("msg_id"):
+            tg.edit_rich(chat_id, live["msg_id"], markdown=answer)
+        else:
+            live["msg_id"] = tg.send_rich(chat_id, markdown=answer,
+                                          thread_id=thread_id)["message_id"]
+
+
+def _stream_answer(tg, msg, live, stop, provider, api_key, model_id, messages,
+                   session_id, tools=None, thread_id=None):
+    """Stream one provider round with live progress.
+    Returns (answer, reasoning, tool_calls). Raises on provider failure.
+    `stop()` is checked every delta so /stop cuts generation short."""
+    chat_id = msg["chat"]["id"]
     answer, reasoning = "", ""
     show_reasoning = True  # until first content token arrives
-    drafts_on = True
     last_flush = 0.0
     for kind, delta in providers.chat_stream(provider, api_key, model_id, messages,
-                                             session_id=session_id):
+                                             session_id=session_id, tools=tools):
+        if kind == "tool_calls":
+            return answer, reasoning, delta
         if kind == "reasoning" and show_reasoning:
             reasoning += delta
         else:
             show_reasoning = False
             answer += delta
+        if stop and stop():
+            log.info("stream cut short by /stop")
+            break
         now = time.time()
-        if drafts_on and now - last_flush > 1.5:
+        if live.get("on") and now - last_flush > 1.5:
             last_flush = now
             try:
-                if show_reasoning and reasoning:
-                    tg.send_rich_draft(
-                        msg["chat"]["id"], draft_id,
-                        html="<tg-thinking>%s</tg-thinking>" % _esc(reasoning[-2000:]),
-                        thread_id=thread_id)
-                elif answer and len(answer) <= md2tg.RICH_LIMIT:
-                    tg.send_rich_draft(msg["chat"]["id"], draft_id,
-                                       markdown=answer, thread_id=thread_id)
+                _flush_live(tg, live, chat_id, thread_id, reasoning, answer,
+                            show_reasoning)
             except tg_mod.TelegramError as e:
-                log.warning("draft updates disabled: %s", e)
-                drafts_on = False
-    if not answer.strip():
-        raise providers.ProviderError("empty answer from stream")
-    return answer, reasoning
+                log.warning("live updates disabled: %s", e)
+                live["on"] = False
+    return answer, reasoning, None
+
+
+INTERRUPT_NOTE = ("[This run was interrupted by the user before it finished - "
+                  "any running command/tool did not complete.]")
 
 
 def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
-    model_full = state.model_for(msg["chat"]["id"], thread_id, cfg.default_model)
+    key = state.chat_key(msg["chat"]["id"], thread_id)
+    state.begin_turn(key)
+    try:
+        _ai_reply(cfg, tg, msg, thread_id, state, text, images)
+    finally:
+        state.end_turn(key)
+
+
+def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
+    chat_id = msg["chat"]["id"]
+    key = state.chat_key(chat_id, thread_id)
+
+    def stop():
+        return state.interrupted(key)
+
+    model_full = state.model_for(chat_id, thread_id, cfg.default_model)
     provider_name, api_key, model_id = _resolve_provider(cfg, model_full)
     if not api_key:
         _err(tg, msg, thread_id, "no API key for provider '%s' (or fallback 'go'/'zen')"
              % provider_name)
         return
-    session_id = "keirai-%s-%s" % (msg["chat"]["id"], thread_id or "main")
+    session_id = "keirai-%s-%s" % (chat_id, thread_id or "main")
 
     content = [{"type": "text", "text": text or "Describe the image."}]
     for mime, b64 in images or []:
         content.append(providers.image_part(mime, b64))
     user_msg = {"role": "user", "content": content if images else text}
 
-    history = state.get_history(msg["chat"]["id"], thread_id)
+    history = state.get_history(chat_id, thread_id)
     history.append(user_msg)
 
     # auto-compact before the context limit is hit
-    if _est_chars(history) > cfg.context_limit_chars and len(history) > 6:
+    if not stop() and _est_chars(history) > cfg.context_limit_chars and len(history) > 6:
         before = len(history)
         try:
             history[:] = _compact(cfg, provider_name, api_key, model_id, history,
                                   session_id)
             log.info("auto-compact: chat=%s thread=%s %d -> %d msgs",
-                     msg["chat"]["id"], thread_id, before, len(history))
+                     chat_id, thread_id, before, len(history))
         except Exception as e:
             log.warning("auto-compact failed (%s) - trimming oldest instead", e)
             del history[:-6]
 
     messages = ([{"role": "system", "content": cfg.system_prompt}] if cfg.system_prompt else []) + history[-HISTORY_LIMIT:]
+    tool_specs = tools_mod.available_specs(cfg)
+    ctx = {"session_id": session_id, "interrupt": stop}
+    live = None
+    if cfg.rich_messages and cfg.stream_drafts:
+        live = {"mode": "draft" if msg["chat"].get("type") == "private" else "edit",
+                "draft_id": secrets.randbelow(10**9) + 1, "msg_id": None, "on": True}
 
-    reasoning = None
-    answer = None
-    can_stream = (cfg.rich_messages and cfg.stream_drafts
-                  and msg["chat"].get("type") == "private")
-    if can_stream:
+    reasoning, answer = None, None
+    interrupted = False
+    for rnd in range(tools_mod.MAX_ROUNDS + 1):
+        if stop():
+            interrupted = True
+            break
+        tcs, got = None, False
+        if live:
+            try:
+                answer, reasoning, tcs = _stream_answer(
+                    tg, msg, live, stop, provider_name, api_key, model_id,
+                    messages, session_id, tools=tool_specs or None,
+                    thread_id=thread_id)
+                got = True
+            except Exception as e:
+                log.warning("streaming failed (%s) - falling back to blocking call", e)
+        if not got and not stop():
+            tg.typing(chat_id, thread_id)
+            try:
+                answer, reasoning, tcs = providers.chat(
+                    provider_name, api_key, model_id, messages,
+                    session_id=session_id, tools=tool_specs or None)
+            except Exception as e:
+                history.pop()  # don't keep failed turns
+                state.persist(chat_id, thread_id)
+                _err(tg, msg, thread_id, "%s error: %s" % (provider_name, e))
+                return
+        if stop():
+            interrupted = True
+            break
+        if not tcs or rnd >= tools_mod.MAX_ROUNDS:
+            break
+        # run the tools the model asked for
+        messages.append({"role": "assistant", "content": answer or "",
+                         "tool_calls": [
+                             {"id": t["id"], "type": "function",
+                              "function": {"name": t["name"],
+                                           "arguments": json.dumps(t["arguments"])}}
+                             for t in tcs]})
+        for t in tcs:
+            if stop():
+                interrupted = True
+                break
+            try:
+                tg.send(chat_id, "\U0001f527 <code>%s</code> %s"
+                        % (_esc(t["name"]),
+                           _esc(tools_mod.preview(t["name"], t["arguments"]))),
+                        thread_id)
+            except tg_mod.TelegramError:
+                pass
+            result = tools_mod.execute(cfg, t["name"], t["arguments"], ctx)
+            messages.append({"role": "tool", "tool_call_id": t["id"],
+                             "content": result})
+            log.info("tool %s -> %d chars", t["name"], len(result))
+            if stop():
+                interrupted = True
+                break
+        if interrupted:
+            break
+        answer = None  # next round must produce the final text
+
+    if interrupted or stop():
+        _deliver_interrupted(tg, state, msg, thread_id, answer, live)
+        return
+
+    if not (answer or "").strip():
+        # round cap hit (or empty answer): final call, tools off
+        tg.typing(chat_id, thread_id)
         try:
-            answer, reasoning = _stream_answer(tg, cfg, msg, thread_id,
-                                               provider_name, api_key, model_id,
-                                               messages, session_id)
+            answer, reasoning, _ = providers.chat(provider_name, api_key, model_id,
+                                                  messages, session_id=session_id)
         except Exception as e:
-            log.warning("streaming failed (%s) - falling back to blocking call", e)
-    if answer is None:
-        tg.typing(msg["chat"]["id"], thread_id)
-        try:
-            answer, reasoning = providers.chat(provider_name, api_key, model_id,
-                                               messages, session_id=session_id)
-        except Exception as e:
-            history.pop()  # don't keep failed turns
-            state.persist(msg["chat"]["id"], thread_id)
+            history.pop()
+            state.persist(chat_id, thread_id)
             _err(tg, msg, thread_id, "%s error: %s" % (provider_name, e))
             return
 
     history.append({"role": "assistant", "content": answer})
     del history[:-HISTORY_LIMIT]
-    state.persist(msg["chat"]["id"], thread_id)
+    state.persist(chat_id, thread_id)
 
     show = state.thinking_on(msg["from"]["id"])
     reasoning_md = reasoning if (show and reasoning and reasoning.strip()) else None
     if cfg.rich_messages:
         try:
-            _send_rich_answer(tg, msg["chat"]["id"], thread_id, answer, reasoning_md)
+            _send_rich_answer(tg, chat_id, thread_id, answer, reasoning_md, live=live)
             return
         except tg_mod.TelegramError as e:
             log.warning("rich send failed, falling back to regular messages: %s", e)
     parts = md2tg.send_parts(answer, reasoning_md)
     for part in parts:
-        tg.send(msg["chat"]["id"], part, thread_id)
+        tg.send(chat_id, part, thread_id)
 
 
-def _send_rich_answer(tg, chat_id, thread_id, answer_md, thinking_md):
-    """Bot API 10.1 rich messages: answer as GFM markdown (native tables,
-    task lists, headings, 32k chars), thinking as a collapsible <details>."""
+def _deliver_interrupted(tg, state, msg, thread_id, partial, live):
+    """Record the /stop interruption in context and tell the user."""
+    chat_id = msg["chat"]["id"]
+    history = state.get_history(chat_id, thread_id)
+    body = (((partial or "").strip() + "\n\n") if (partial or "").strip() else "")
+    history.append({"role": "assistant", "content": body + INTERRUPT_NOTE})
+    del history[:-HISTORY_LIMIT]
+    state.persist(chat_id, thread_id)
+    if live and live.get("msg_id"):  # drop the half-finished live message
+        try:
+            tg.delete_message(chat_id, live["msg_id"])
+        except Exception:
+            pass
+    log.info("turn interrupted by user: chat=%s thread=%s", chat_id, thread_id)
+    try:
+        tg.send(chat_id, "\u23f9 stopped - the running reply/tool was interrupted.",
+                thread_id)
+    except tg_mod.TelegramError:
+        pass
+
+
+def _send_rich_answer(tg, chat_id, thread_id, answer_md, thinking_md, live=None):
+    """Bot API 10.1 rich messages: thinking as a collapsible <details> first,
+    then the answer as GFM markdown chunks (32k each). When a live edit-mode
+    placeholder exists, the first chunk edits it in instead of sending new."""
+    items = []  # (kind, src), kind: "html" | "markdown"
     if thinking_md:
         for chunk in md2tg.split(thinking_md, md2tg.RICH_LIMIT):
-            tg.send_rich(chat_id, html="<details><summary>\U0001f914 Thinking</summary>%s</details>" % chunk,
-                         thread_id=thread_id)
+            items.append(("html",
+                          "<details><summary>\U0001f914 Thinking</summary>%s</details>"
+                          % chunk))
     for chunk in md2tg.split_rich(answer_md):
-        tg.send_rich(chat_id, markdown=chunk, thread_id=thread_id)
+        items.append(("markdown", chunk))
+    if live and live.get("msg_id"):
+        kind, src = items[0]
+        try:
+            if kind == "html":
+                tg.edit_rich(chat_id, live["msg_id"], html=src)
+            else:
+                tg.edit_rich(chat_id, live["msg_id"], markdown=src)
+            items = items[1:]
+        except tg_mod.TelegramError as e:
+            log.warning("final live edit failed, sending fresh: %s", e)
+            try:
+                tg.delete_message(chat_id, live["msg_id"])
+            except Exception:
+                pass
+    for kind, src in items:
+        if kind == "html":
+            tg.send_rich(chat_id, html=src, thread_id=thread_id)
+        else:
+            tg.send_rich(chat_id, markdown=src, thread_id=thread_id)
 
 
 # ---------------------------------------------------------------- media
@@ -668,7 +861,79 @@ def handle_message(cfg, tg, msg, state):
         return
 
     if text.strip():
+        reply_ctx = _reply_context(msg)
+        if reply_ctx:
+            text = reply_ctx + "\n\n" + text
         ai_reply(cfg, tg, msg, thread_id, state, text)
+
+
+def _reply_context(msg):
+    """Annotation for replies/quotes so the model sees the referenced text
+    (item 17). The reply object carries the full referenced message."""
+    reply = msg.get("reply_to_message")
+    if not reply:
+        return ""
+    sender = reply.get("from") or {}
+    who = sender.get("username") or sender.get("first_name") or "someone"
+    body = reply.get("text") or reply.get("caption") or ""
+    quote = msg.get("quote")  # user quoted a part of the message
+    if quote is not None:
+        q = (quote.get("text") or "") if isinstance(quote, dict) else str(quote)
+        return "user is quoting this part of a message (from @%s):\n%s" % (
+            who, (q[:1200] or "(empty quote)"))
+    if not body:
+        body = ("(the referenced message has no extractable text - "
+                "it may be media or a rich message)")
+    return "user is replying to this message (from @%s):\n%s" % (who, body[:1500])
+
+
+# ------------------------------------------------------- /stop + update watcher
+# The bot is single-threaded: while a reply/tool turn runs, no one polls
+# getUpdates. A watcher thread owns polling forever, feeds updates to a queue
+# the main loop drains, and intercepts /stop so an in-flight turn can be
+# interrupted via a thread-safe flag (everything else is queued, never lost).
+
+def _msg_key(msg):
+    return (msg["chat"]["id"], msg.get("message_thread_id"))
+
+
+def _is_stop_cmd(msg):
+    text = (msg.get("text") or "").strip()
+    if not text.startswith("/stop"):
+        return False
+    rest = text[len("/stop"):]
+    return rest == "" or rest[0] in " @"  # /stop, /stop@botname
+
+
+def _route_update(state, out_q, upd):
+    """Watcher decision: consume /stop for a running turn, else queue.
+    Returns True when the update was consumed (not queued)."""
+    msg = upd.get("message")
+    if msg and _is_stop_cmd(msg):
+        if state.request_interrupt(_msg_key(msg)):
+            log.info("stop requested: chat=%s thread=%s",
+                     msg["chat"]["id"], msg.get("message_thread_id"))
+            return True
+    out_q.put(upd)
+    return False
+
+
+def _watch_updates(tg, state, out_q):
+    """Long-poll getUpdates forever. Sole owner of the offset."""
+    offset = None
+    backoff = 1
+    while True:
+        try:
+            updates = tg.get_updates(offset)
+            backoff = 1
+        except tg_mod.TelegramError as e:
+            log.error("poll error: %s", e)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+        for upd in updates:
+            offset = upd["update_id"] + 1
+            _route_update(state, out_q, upd)
 
 
 # ---------------------------------------------------------------- main
@@ -723,30 +988,22 @@ def main():
     except tg_mod.TelegramError as e:
         log.warning("setMyCommands failed: %s", e)
     log.info("polling... (default model: %s)", cfg.default_model)
-    offset = None
-    backoff = 1
+    out_q = queue.Queue()
+    threading.Thread(target=_watch_updates, args=(tg, state, out_q),
+                     daemon=True, name="updates").start()
     while True:
-        try:
-            updates = tg.get_updates(offset)
-            backoff = 1
-        except tg_mod.TelegramError as e:
-            log.error("poll error: %s", e)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+        upd = out_q.get()
+        msg = upd.get("message")
+        if not msg:
             continue
-        for upd in updates:
-            offset = upd["update_id"] + 1
-            msg = upd.get("message")
-            if not msg:
-                continue
+        try:
+            handle_message(cfg, tg, msg, state)
+        except Exception as e:
+            log.exception("handler error")
             try:
-                handle_message(cfg, tg, msg, state)
-            except Exception as e:
-                log.exception("handler error")
-                try:
-                    tg.send(msg["chat"]["id"], "error: %s" % _esc(str(e)), msg.get("message_thread_id"))
-                except Exception:
-                    pass
+                tg.send(msg["chat"]["id"], "error: %s" % _esc(str(e)), msg.get("message_thread_id"))
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------- helpers

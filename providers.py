@@ -148,9 +148,10 @@ def cached_models(name, api_key, cache_dir, force_refresh=False):
 
 # ---------------------------------------------------------------- chat
 
-def chat(name, api_key, model, messages, extra=None, session_id=None):
-    """One chat completion. Returns (content, reasoning).
+def chat(name, api_key, model, messages, extra=None, session_id=None, tools=None):
+    """One chat completion. Returns (content, reasoning, tool_calls).
 
+    tool_calls: [{"id", "name", "arguments"(dict)}] or None.
     session_id: stable per-conversation id, required by OpenCode Go
     (sent as x-opencode-session header).
     """
@@ -158,6 +159,8 @@ def chat(name, api_key, model, messages, extra=None, session_id=None):
     if not base:
         raise ProviderError("unknown provider: %s" % name)
     payload = {"model": model, "messages": messages}
+    if tools:
+        payload["tools"] = tools
     if extra:
         payload.update(extra)
     resp = _request(base + "/chat/completions", api_key, payload=payload,
@@ -170,18 +173,44 @@ def chat(name, api_key, model, messages, extra=None, session_id=None):
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
     if isinstance(reasoning, dict):
         reasoning = reasoning.get("content") or ""
-    return content, reasoning
+    return content, reasoning, parse_tool_calls(msg.get("tool_calls"))
 
 
-def chat_stream(name, api_key, model, messages, session_id=None):
-    """Streaming chat completion. Yields ("reasoning"|"content", delta_text).
+def parse_tool_calls(raw):
+    """OpenAI tool_calls -> [{"id","name","arguments"(dict)}] or None."""
+    if not raw or not isinstance(raw, list):
+        return None
+    out = []
+    for tc in raw:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except ValueError:
+                args = {"_raw": args}
+        elif not isinstance(args, dict):
+            args = {}
+        out.append({"id": tc.get("id") or "", "name": fn.get("name") or "",
+                    "arguments": args})
+    return out or None
 
+
+def chat_stream(name, api_key, model, messages, session_id=None, tools=None):
+    """Streaming chat completion.
+
+    Yields ("reasoning"|"content", delta_text) while generating and, when the
+    model called tools, a final ("tool_calls", [...]) before stopping.
     OpenAI-compatible SSE (stream: true). Raises ProviderError on failure.
     """
     base = PROVIDER_BASES.get(name)
     if not base:
         raise ProviderError("unknown provider: %s" % name)
     payload = {"model": model, "messages": messages, "stream": True}
+    if tools:
+        payload["tools"] = tools
     headers = {"Authorization": "Bearer %s" % api_key, "User-Agent": "keirai/0.1",
                "Content-Type": "application/json", "Accept": "text/event-stream"}
     if session_id:
@@ -195,6 +224,7 @@ def chat_stream(name, api_key, model, messages, session_id=None):
         raise ProviderError("HTTP %d from %s: %s" % (e.code, base, body[:300]))
     except urllib.error.URLError as e:
         raise ProviderError("%s: %s" % (base, e.reason))
+    tool_acc = {}  # index -> {"id","name","args"}
     with resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
@@ -219,6 +249,34 @@ def chat_stream(name, api_key, model, messages, session_id=None):
             content = delta.get("content")
             if content:
                 yield "content", content
+            for i, tc in enumerate(delta.get("tool_calls") or []):
+                if not isinstance(tc, dict):
+                    continue
+                slot = tool_acc.setdefault(tc.get("index", i), {"id": "", "name": "",
+                                                                "args": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["args"] += fn["arguments"]
+    if tool_acc:
+        calls = []
+        for key in sorted(tool_acc):
+            slot = tool_acc[key]
+            if not slot["name"]:
+                continue
+            args = slot["args"]
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except ValueError:
+                args = {"_raw": args}
+            if not isinstance(args, dict):
+                args = {"_raw": str(args)}
+            calls.append({"id": slot["id"], "name": slot["name"], "arguments": args})
+        if calls:
+            yield "tool_calls", calls
 
 
 def image_part(mime, data_b64):

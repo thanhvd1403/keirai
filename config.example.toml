@@ -12,6 +12,14 @@ thinking_default = true                  # show AI reasoning by default
 rich_messages = true                     # Bot API 10.1 rich messages (native tables, task lists); auto-falls back to regular messages on error
 stream_drafts = true                      # live streaming via sendRichMessageDraft (private chats); falls back to blocking on error
 context_limit_chars = 120000             # auto-compact a session when its history exceeds this many characters
+
+# ---- agent tools (P2)
+tools_enabled = true                     # master switch for LLM tools (files/shell/web/browser)
+bash_timeout = 30                        # default shell timeout in seconds (the agent may override per call, 1-300)
+# parallel_api_key = ""                  # optional: raises limits on the FREE Parallel Search MCP (platform.parallel.ai);
+                                         # web_search/web_fetch work anonymously without it
+# Lightpanda browser: run `bash deploy/install_lightpanda.sh` - the browse
+# tool only appears to the model after the binary is installed in ./tools/
 default_model = "zen/glm-5.3-flash"      # provider/model-id
 max_file_mb = 20                         # download size cap
 system_prompt = """You are Keirai, a lightweight AI agent running on a small server. Answer using markdown."""

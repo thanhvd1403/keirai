@@ -67,7 +67,10 @@
   - Final `sendRichMessage` persists the message (draft is ephemeral, ~30s)
   - `stream_drafts` config toggle; automatic fallback to blocking call on any error
 - [x] `==marked==`, footnotes, `$$formulas$$`, inline HTML - work automatically via GFM markdown passthrough
-- [ ] Media blocks in answers (rich media needs HTTP URLs) and `editMessageText(rich_message=...)` for live edits after send
+- [x] Media blocks in answers: `![alt](url)` passes through natively on the rich path; the regular path degrades it to a link (Telegram HTML has no `<img>`)
+- [x] `editMessageText(rich_message=...)` for live edits after send
+  - Non-private chats stream via send placeholder + rich edits (drafts are private-only); first chunk of the final answer edits the placeholder in
+  - Any edit failure deletes the placeholder and sends fresh
 
 ## P1 - Session Management & Context Control
 
@@ -104,34 +107,46 @@
 
 ## P2 - Core Tools & Message Context
 
-> First real tools for the agent. Build on the tool registry/interface design.
+> First real tools for the agent. Built on OpenAI function-calling specs
+> (`tools.py` registry: `available_specs(cfg)` + `execute(cfg, name, args, ctx)`);
+> tool rounds are not persisted to history - only the final answer is.
 
 ### 14. File & shell tools
-- [ ] `read_file` - read file contents (with size limits)
-- [ ] `write_file` - create/overwrite files
-- [ ] `edit_file` - targeted edit (search/replace, not full rewrite)
-- [ ] `bash` - execute shell commands
-  - Timeout + output size limits
-  - Safety measures (TBD: confirmation, blacklist, sandboxing)
+- [x] `read_file` - read file contents (size caps: 200 KB hard, default 50 KB, `max_chars` arg)
+- [x] `write_file` - create/overwrite files (creates parent directories)
+- [x] `edit_file` - targeted edit (exact match, must be unique - errors otherwise, no full rewrites)
+- [x] `bash` - execute shell commands
+  - Timeout: config `bash_timeout` (default 30s), agent-settable per call (`timeout_seconds`, clamped 1-300)
+  - Safety per agreed decision: destructive-command blacklist (rm -rf on /, mkfs, dd to /dev, shutdown/reboot, fork bombs, curl|sh, ...); NO path sandbox (single trusted operator)
+  - Output too long -> saved to `logs/bash-out-*.txt`, model told to `read_file` it
+  - Interruptible: polls the /stop flag and kills the process mid-run
 
 ### 15. Web search & fetch (Parallel API)
-- [ ] `web_search` via Parallel Search API (parallel.ai, built for AI agents)
-- [ ] `web_fetch` via Parallel Extract API (full/excerpted content, handles JS-heavy pages and PDFs)
-- [ ] API key via config
-- [ ] Check Parallel license/pricing terms before implementing
+- [x] `web_search` via Parallel Search MCP (free, anonymous - no API key needed)
+- [x] `web_fetch` via the same MCP (excerpts or `full_content`; handles JS pages and PDFs)
+- [x] API key via config: optional `parallel_api_key` / `PARALLEL_API_KEY` only raises rate limits
+- [x] License/pricing checked: Search MCP is free at https://search.parallel.ai/mcp
+  (paid API from $1/1k requests, free monthly allowance); commercial service - no license issue (REST calls only)
+- [x] Stdlib streamable-HTTP MCP client (`websearch.py`): initialize -> notifications/initialized -> tools/call, JSON or SSE bodies
 
 ### 16. Browser (Lightpanda)
-- [ ] Use Lightpanda headless browser (lightpanda.io) for pages needing full JS rendering
-  - Written in Zig, ~16x less RAM than headless Chrome - fits our memory budget
-- [ ] Drive it from Python via CDP (Playwright/Puppeteer-compatible) or its HTTP API
-- [ ] Start/stop browser process on demand (don't keep it resident)
-- [ ] Check Lightpanda license compatibility before implementing
+- [x] License checked: Lightpanda is **AGPLv3** - same as Keirai, fully compatible (separate process, never linked)
+- [x] Drive it from Python: `lightpanda fetch --dump markdown <url>` via subprocess - renders JS, prints markdown; no CDP/WebSocket client needed (CDP reserved for future interactive needs like clicks/forms)
+- [x] Start/stop on demand: one subprocess per call, never resident; telemetry disabled (`LIGHTPANDA_DISABLE_TELEMETRY=true`)
+- [x] Install script: `bash deploy/install_lightpanda.sh` puts the binary in `keirai/tools/lightpanda`; the `browse` tool only appears to the model after install (or when `lightpanda` is on PATH)
 
 ### 17. Reply-to-message context
-- [ ] Detect replies via `reply_to_message` on incoming Telegram updates
-- [ ] Detect quoted text (Telegram `quote` object) and distinguish "replying to this message" vs "quoting this part"
-- [ ] Inject the referenced message into the LLM context as an annotation, e.g. "user is replying to this message: ..." / "user is quoting: ..."
-- [ ] Handle replies to the bot's own messages and to older messages (store/fetch referenced content, respect context limits)
+- [x] Detect replies via `reply_to_message` and inject the referenced message as an annotation ("user is replying to this message (from @x): ...")
+- [x] Detect quoted text (`quote` object) - "user is quoting this part of a message: ..."
+- [x] Handle replies to the bot's own messages and older messages (content arrives in the reply object; capped at 1500 chars to respect context limits; no-text replies noted as media/rich message)
+
+### 18. /stop - interrupt running work
+- [x] `/stop` interrupts the reply/tool turn running in the current chat+thread
+  - The bot is single-threaded, so an update-watcher thread owns getUpdates and feeds a queue; it intercepts /stop during an active turn (other messages are queued, never lost)
+  - Interruption points: every streaming delta, every tool round, before/after each tool, and mid-`bash` (process killed)
+  - Context marker written for the next turn: "[This run was interrupted by the user before it finished - any running command/tool did not complete.]" (says the user interrupted, without referencing the /stop command)
+  - Partial live message (edit mode) is deleted; user gets "stopped - the running reply/tool was interrupted"
+  - Idle `/stop` replies "nothing is running right now"
 
 ## P3 - Custom OpenAI-Compatible Providers
 

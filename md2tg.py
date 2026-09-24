@@ -65,6 +65,8 @@ def split_blocks(md):
 def _inline_text(text):
     """Convert inline markdown (no code spans) in raw text to Telegram HTML."""
     t = _html.escape(text, quote=False)
+    # Telegram HTML cannot embed images: ![alt](url) -> plain link
+    t = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", r"[\1](\2)", t)
     t = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r'<a href="\2">\1</a>', t)
     t = re.sub(r'(?<!["\'>])\b(https?://[^\s<]+)', r'<a href="\1">\1</a>', t)
     t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t, flags=re.S)

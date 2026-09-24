@@ -39,6 +39,10 @@ class Config:
         self.context_limit_chars = int(data.get("context_limit_chars", 120_000))
         self.default_model = data.get("default_model", "zen/glm-5.3-flash")
         self.max_file_mb = int(data.get("max_file_mb", 20))
+        self.tools_enabled = bool(data.get("tools_enabled", True))
+        self.bash_timeout = int(data.get("bash_timeout", 30))
+        self.parallel_api_key = (os.environ.get("PARALLEL_API_KEY")
+                                 or data.get("parallel_api_key", ""))
         self.system_prompt = data.get("system_prompt", "You are Keirai, a lightweight AI agent.")
         providers = data.get("providers", {}) or {}
         self.providers = {}
@@ -88,15 +92,18 @@ def load(path=None):
     return Config({}, path=None)
 
 
+def base_dir(config):
+    """Directory of the config file (or cwd) - project root for keirai paths."""
+    return os.path.dirname(os.path.abspath(config.path)) if config.path else os.getcwd()
+
+
 def cache_dir(config):
     """Cache directory next to the config file (or ./cache)."""
-    base = os.path.dirname(os.path.abspath(config.path)) if config.path else os.getcwd()
-    d = os.path.join(base, "cache")
+    d = os.path.join(base_dir(config), "cache")
     os.makedirs(d, exist_ok=True)
     return d
 
 
 def sessions_path(config):
     """SQLite session db path next to the config file (or ./sessions.db)."""
-    base = os.path.dirname(os.path.abspath(config.path)) if config.path else os.getcwd()
-    return os.path.join(base, "sessions.db")
+    return os.path.join(base_dir(config), "sessions.db")

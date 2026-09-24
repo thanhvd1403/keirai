@@ -56,15 +56,15 @@ class TestChatParsing(unittest.TestCase):
         self.assertEqual(args[1]["session_id"], "keirai-100-77")
 
     def test_reasoning_content(self):
-        (content, reasoning), _ = self._chat({"content": "answer", "reasoning_content": "thinking..."})
-        self.assertEqual((content, reasoning), ("answer", "thinking..."))
+        (content, reasoning, tcs), _ = self._chat({"content": "answer", "reasoning_content": "thinking..."})
+        self.assertEqual((content, reasoning, tcs), ("answer", "thinking...", None))
 
     def test_reasoning_dict(self):
-        (content, reasoning), _ = self._chat({"content": "a", "reasoning": {"content": "r"}})
+        (content, reasoning, _tcs), _ = self._chat({"content": "a", "reasoning": {"content": "r"}})
         self.assertEqual(reasoning, "r")
 
     def test_no_reasoning(self):
-        (content, reasoning), _ = self._chat({"content": "a"})
+        (content, reasoning, _tcs), _ = self._chat({"content": "a"})
         self.assertEqual(reasoning, "")
 
 

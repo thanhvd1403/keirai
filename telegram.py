@@ -93,6 +93,16 @@ class Telegram:
             payload["message_thread_id"] = thread_id
         return self.call("sendRichMessageDraft", payload, timeout=30)
 
+    def edit_rich(self, chat_id, message_id, markdown=None, html=None):
+        """Bot API 10.1 live edit of a previously sent rich message
+        (editMessageText with rich_message). Exactly one of markdown/html."""
+        rich = {"markdown": markdown} if markdown is not None else {"html": html}
+        payload = {"chat_id": chat_id, "message_id": message_id, "rich_message": rich}
+        return self.call("editMessageText", payload, timeout=30)
+
+    def delete_message(self, chat_id, message_id):
+        return self.call("delete_message", {"chat_id": chat_id, "message_id": message_id})
+
     def typing(self, chat_id, thread_id=None):
         payload = {"chat_id": chat_id, "action": "typing"}
         if thread_id:

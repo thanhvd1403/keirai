@@ -3,6 +3,7 @@ __pycache__/
 config.json
 config.toml
 sessions.db
+tools/
 cache/
 logs/
 .venv/

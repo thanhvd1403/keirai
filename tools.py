@@ -1,0 +1,305 @@
+"""Agent tools: files, shell, web search/fetch, browser. Stdlib only.
+
+Tools are OpenAI function-calling specs handed to the provider; execute()
+runs them locally and returns text for the model. Safety per project rules:
+- bash: destructive-command blacklist + timeout (agent-settable 1..300s)
+- long output: saved to a file, model is told to read_file it
+- file tools: no path sandbox (single trusted operator), size caps only
+Handlers never raise: errors come back as strings so the tool loop continues.
+"""
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import time
+
+import browser
+import config as config_mod
+import websearch
+
+MAX_ROUNDS = 6        # max tool-call rounds per user turn
+RESULT_CAP = 40_000   # chars of tool output fed back to the model
+OUTPUT_CAP = 40_000   # bash output kept inline; beyond -> file
+READ_CAP = 200_000    # read_file hard cap
+
+# Destructive / reckless commands the model must never run.
+BASH_DENY = [
+    r"\brm\s+(-[a-z]+\s+)*-[a-z]*[rf][a-z]*\s+(/\s*$|/[^ ]|~|\$HOME|\.)",
+    r"\bmkfs",
+    r"\bdd\s+[^\n]*\bof=/dev/",
+    r"\b(shutdown|reboot|halt|poweroff)\b",
+    r":\s*\(\s*\)\s*\{.*\|.*&.*\};",          # fork bomb
+    r">\s*/dev/sd[a-z]",
+    r"\bchmod\s+-R\s+777\s+(/|~)\s*$",
+    r"\b(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b",  # pipe remote to shell
+    r"\bsudo\s+(rm|mkfs|dd)\b",
+    r"\bformat\s+[a-z]:",
+]
+
+
+class ToolError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- specs
+
+def _fn(name, desc, props, required):
+    return {"type": "function", "function": {
+        "name": name, "description": desc,
+        "parameters": {"type": "object", "properties": props, "required": required},
+    }}
+
+
+def available_specs(cfg):
+    """Tool specs the model may call, based on config + installed extras."""
+    if not getattr(cfg, "tools_enabled", True):
+        return []
+    specs = [
+        _fn("read_file",
+            "Read a UTF-8 text file and return its contents.",
+            {"path": {"type": "string", "description": "File to read"},
+             "max_chars": {"type": "integer",
+                           "description": "Max chars to return (default 50000, max 200000)"}},
+            ["path"]),
+        _fn("write_file",
+            "Create or overwrite a file with the given content (creates parent directories).",
+            {"path": {"type": "string", "description": "File to write"},
+             "content": {"type": "string", "description": "Full file content"}},
+            ["path", "content"]),
+        _fn("edit_file",
+            "Replace an exact string in a file. old_string must match exactly once - "
+            "include surrounding context if needed. Never rewrites the whole file.",
+            {"path": {"type": "string", "description": "File to edit"},
+             "old_string": {"type": "string", "description": "Exact text to find (must be unique)"},
+             "new_string": {"type": "string", "description": "Replacement text"}},
+            ["path", "old_string", "new_string"]),
+        _fn("bash",
+            "Execute a shell command; returns exit code and output. Destructive commands "
+            "are blocked by a safety blacklist. Very long output is written to a file - "
+            "use read_file on that path to see the rest.",
+            {"command": {"type": "string", "description": "Shell command to run"},
+             "timeout_seconds": {"type": "integer",
+                                 "description": "Optional timeout 1-300s "
+                                                "(default: server config, 30s)"}},
+            ["command"]),
+        _fn("web_search",
+            "Search the live web; returns ranked URLs with LLM-optimized excerpts. "
+            "Use for current facts, news, documentation and anything after the "
+            "model's training cutoff.",
+            {"objective": {"type": "string",
+                           "description": "Natural-language description of what to find"},
+             "search_queries": {"type": "array", "items": {"type": "string"},
+                                "description": "2-3 diverse keyword queries, 3-6 words each"}},
+            ["objective", "search_queries"]),
+        _fn("web_fetch",
+            "Fetch one or more URLs and return clean markdown/excerpts "
+            "(handles JS-heavy pages and PDFs). Use after web_search, or when "
+            "given a URL to read.",
+            {"urls": {"type": "array", "items": {"type": "string"},
+                      "description": "1-20 HTTP(S) URLs"},
+             "objective": {"type": "string",
+                           "description": "Optional: what to look for (focused excerpts)"},
+             "full_content": {"type": "boolean",
+                              "description": "Return full page markdown (can be huge); "
+                                             "default false = excerpts"}},
+            ["urls"]),
+    ]
+    if browser.find_binary(cfg):
+        specs.append(_fn(
+            "browse",
+            "Render a page in a headless browser (JavaScript executes) and return its "
+            "markdown. Use when web_fetch is not enough (heavy JS apps, SPAs).",
+            {"url": {"type": "string", "description": "URL to open"},
+             "wait_ms": {"type": "integer",
+                         "description": "Wait up to N ms for JS rendering (default 1500, max 15000)"}},
+            ["url"]))
+    return specs
+
+
+# ---------------------------------------------------------------- exec
+
+def execute(cfg, name, args, ctx=None):
+    """Run a tool. Returns text for the model; never raises."""
+    args = args if isinstance(args, dict) else {}
+    ctx = ctx or {}
+    handler = {"read_file": _read_file, "write_file": _write_file,
+               "edit_file": _edit_file, "bash": _bash,
+               "web_search": _web_search, "web_fetch": _web_fetch,
+               "browse": _browse}.get(name)
+    if handler is None:
+        return "error: unknown tool %r" % name
+    try:
+        out = handler(cfg, args, ctx)
+    except ToolError as e:
+        return "error: %s" % e
+    except Exception as e:  # tools must never crash the turn
+        return "error: %s: %s" % (type(e).__name__, e)
+    if out is None:
+        return ""
+    if len(out) > RESULT_CAP:
+        out = out[:RESULT_CAP] + "\n... [output truncated at %d chars]" % RESULT_CAP
+    return out
+
+
+def preview(name, args):
+    """Short single-line description of a tool call for the progress message."""
+    bits = []
+    for v in (args or {}).values():
+        if isinstance(v, str):
+            bits.append(v.replace("\n", " ")[:60])
+        elif isinstance(v, (int, float, bool)):
+            bits.append(str(v))
+        elif isinstance(v, list):
+            bits.append(" ".join(str(x) for x in v)[:60])
+        if len(bits) >= 2:
+            break
+    return " ".join(bits)[:100]
+
+
+# ---------------------------------------------------------------- files
+
+def _read_file(cfg, args, ctx):
+    path = os.path.expanduser(str(args.get("path", "")))
+    if not path:
+        raise ToolError("path is required")
+    cap = min(int(args.get("max_chars") or 50_000), READ_CAP)
+    if not os.path.isfile(path):
+        raise ToolError("no such file: %s" % path)
+    size = os.path.getsize(path)
+    if size > READ_CAP:
+        raise ToolError("file too large (%d bytes); max %d" % (size, READ_CAP))
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = f.read(cap)
+    if len(data) == cap:
+        data += "\n... [truncated at %d chars; raise max_chars up to %d]" % (cap, READ_CAP)
+    return data
+
+
+def _write_file(cfg, args, ctx):
+    path = os.path.expanduser(str(args.get("path", "")))
+    content = args.get("content")
+    if not path or not isinstance(content, str):
+        raise ToolError("path and content are required")
+    if len(content) > READ_CAP:
+        raise ToolError("content too large (%d chars)" % len(content))
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return "wrote %d chars to %s" % (len(content), path)
+
+
+def _edit_file(cfg, args, ctx):
+    path = os.path.expanduser(str(args.get("path", "")))
+    old, new = args.get("old_string"), args.get("new_string")
+    if not path or not isinstance(old, str) or not isinstance(new, str):
+        raise ToolError("path, old_string and new_string are required")
+    if not old:
+        raise ToolError("old_string must not be empty")
+    if not os.path.isfile(path):
+        raise ToolError("no such file: %s" % path)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = f.read()
+    n = data.count(old)
+    if n == 0:
+        raise ToolError("old_string not found in %s" % path)
+    if n > 1:
+        raise ToolError("old_string matches %d times in %s - add more context to make "
+                        "it unique" % (n, path))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(data.replace(old, new, 1))
+    return "edited %s (replaced 1 occurrence)" % path
+
+
+# ---------------------------------------------------------------- shell
+
+def _deny(cmd):
+    for pat in BASH_DENY:
+        if re.search(pat, cmd, re.IGNORECASE):
+            return pat
+    return None
+
+
+def _bash(cfg, args, ctx):
+    command = str(args.get("command", "")).strip()
+    if not command:
+        raise ToolError("command is required")
+    denied = _deny(command)
+    if denied:
+        return ("command blocked by safety blacklist (pattern: %s). "
+                "Find a non-destructive alternative." % denied)
+    timeout = int(args.get("timeout_seconds") or getattr(cfg, "bash_timeout", 30))
+    timeout = max(1, min(timeout, 300))
+    interrupt = ctx.get("interrupt") if isinstance(ctx, dict) else None
+    proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, errors="replace")
+    deadline = time.time() + timeout
+    timed_out = interrupted = False
+    while True:  # poll so /stop can kill a running command mid-flight
+        try:
+            out, _ = proc.communicate(timeout=0.25)
+            break
+        except subprocess.TimeoutExpired:
+            if interrupt and interrupt():
+                interrupted = True
+                proc.kill()
+                out, _ = proc.communicate()
+                break
+            if time.time() >= deadline:
+                timed_out = True
+                proc.kill()
+                out, _ = proc.communicate()
+                break
+    out = out or ""
+    if interrupted:
+        header = "INTERRUPTED by the user (command did not finish; output below may be partial)\n"
+    elif timed_out:
+        header = "TIMED OUT after %ds (output below may be partial)\n" % timeout
+    else:
+        header = "exit code %d\n" % proc.returncode
+    body = header + out
+    if len(body) <= OUTPUT_CAP:
+        return body
+    # too long: save full output, hand back a head + the path
+    logdir = os.path.join(config_mod.base_dir(cfg), "logs")
+    os.makedirs(logdir, exist_ok=True)
+    path = os.path.join(logdir, "bash-out-%s-%s.txt"
+                        % (time.strftime("%Y%m%d-%H%M%S"), secrets.token_hex(3)))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    head = body[:OUTPUT_CAP]
+    return (head
+            + "\n... [output truncated: full output saved to %s - use read_file to "
+              "read more]" % path)
+
+
+# ---------------------------------------------------------------- web
+
+def _web_search(cfg, args, ctx):
+    objective = str(args.get("objective", "")).strip()
+    queries = args.get("search_queries") or []
+    if not objective or not isinstance(queries, list) or not queries:
+        raise ToolError("objective and search_queries are required")
+    return websearch.search(cfg, objective, [str(q) for q in queries],
+                            session_id=ctx.get("session_id"))
+
+
+def _web_fetch(cfg, args, ctx):
+    urls = args.get("urls") or []
+    if not isinstance(urls, list) or not urls:
+        raise ToolError("urls is required")
+    return websearch.fetch(cfg, [str(u) for u in urls],
+                           objective=args.get("objective") or None,
+                           full_content=bool(args.get("full_content")),
+                           session_id=ctx.get("session_id"))
+
+
+# ---------------------------------------------------------------- browser
+
+def _browse(cfg, args, ctx):
+    url = str(args.get("url", "")).strip()
+    if not url:
+        raise ToolError("url is required")
+    wait_ms = max(0, min(int(args.get("wait_ms") or 1500), 15000))
+    return browser.browse(cfg, url, wait_ms=wait_ms)
