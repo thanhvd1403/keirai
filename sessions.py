@@ -4,6 +4,7 @@ Stdlib sqlite3. Write-through: main updates state then persists the row.
 thread_id 0 is the sentinel for "main chat, no topic".
 """
 import json
+import secrets
 import sqlite3
 import time
 
@@ -22,7 +23,25 @@ CREATE TABLE IF NOT EXISTS topics (
   name TEXT,
   PRIMARY KEY (chat_id, thread_id)
 );
+CREATE TABLE IF NOT EXISTS session_meta (
+  chat_id INTEGER NOT NULL,
+  thread_id INTEGER NOT NULL,
+  session_id TEXT,
+  name TEXT,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  tokens_in INTEGER NOT NULL DEFAULT 0,
+  tokens_out INTEGER NOT NULL DEFAULT 0,
+  tokens_cached_read INTEGER NOT NULL DEFAULT 0,
+  tokens_cached_write INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (chat_id, thread_id)
+);
 """
+
+
+def new_session_id(ts=None):
+    """Stable session id: yyyymmdd-hhmm-4hex, assigned at creation."""
+    return time.strftime("%Y%m%d-%H%M", time.localtime(ts or time.time())) \
+        + "-" + secrets.token_hex(2)
 
 
 class Store:
@@ -30,7 +49,20 @@ class Store:
         self.path = path
         self.conn = sqlite3.connect(path)
         self.conn.executescript(SCHEMA)
+        self._backfill_meta()
         self.conn.commit()
+
+    def _backfill_meta(self):
+        """Give pre-existing sessions a session id; fill any NULL ids."""
+        rows = self.conn.execute(
+            "SELECT chat_id, thread_id, updated_at FROM sessions").fetchall()
+        for chat_id, thread_id, updated in rows:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO session_meta (chat_id, thread_id, session_id) "
+                "VALUES (?, ?, ?)", (chat_id, thread_id, new_session_id(updated)))
+        self.conn.execute(
+            "UPDATE session_meta SET session_id=? WHERE session_id IS NULL",
+            (new_session_id(),))
 
     # ------------------------------------------------ sessions
 
@@ -46,6 +78,8 @@ class Store:
 
     def delete_session(self, chat_id, thread_id):
         self.conn.execute("DELETE FROM sessions WHERE chat_id=? AND thread_id=?",
+                          (chat_id, thread_id))
+        self.conn.execute("DELETE FROM session_meta WHERE chat_id=? AND thread_id=?",
                           (chat_id, thread_id))
         self.conn.commit()
 
@@ -70,8 +104,60 @@ class Store:
             "SELECT thread_id FROM topics WHERE chat_id=?", (chat_id,)).fetchall()]
         self.conn.execute("DELETE FROM sessions WHERE chat_id=?", (chat_id,))
         self.conn.execute("DELETE FROM topics WHERE chat_id=?", (chat_id,))
+        self.conn.execute("DELETE FROM session_meta WHERE chat_id=?", (chat_id,))
         self.conn.commit()
         return topics
+
+    # ------------------------------------------------ session meta
+    # session id + name + cost/token accumulators, stored separately from the
+    # history row so save_session's INSERT OR REPLACE can never wipe them.
+
+    def load_meta(self):
+        """{(chat_id, thread_id): {session_id, name, cost_usd, tokens_*}}"""
+        rows = self.conn.execute(
+            "SELECT chat_id, thread_id, session_id, name, cost_usd, tokens_in,"
+            " tokens_out, tokens_cached_read, tokens_cached_write"
+            " FROM session_meta").fetchall()
+        return {(r[0], r[1]): {"session_id": r[2], "name": r[3], "cost_usd": r[4],
+                               "tokens_in": r[5], "tokens_out": r[6],
+                               "tokens_cached_read": r[7],
+                               "tokens_cached_write": r[8]} for r in rows}
+
+    def ensure_meta(self, chat_id, thread_id):
+        """Meta dict for (chat, thread), creating the row if missing."""
+        row = self.conn.execute(
+            "SELECT session_id, name, cost_usd, tokens_in, tokens_out,"
+            " tokens_cached_read, tokens_cached_write FROM session_meta"
+            " WHERE chat_id=? AND thread_id=?", (chat_id, thread_id)).fetchone()
+        if row:
+            return {"session_id": row[0], "name": row[1], "cost_usd": row[2],
+                    "tokens_in": row[3], "tokens_out": row[4],
+                    "tokens_cached_read": row[5], "tokens_cached_write": row[6]}
+        meta = {"session_id": new_session_id(), "name": None, "cost_usd": 0.0,
+                "tokens_in": 0, "tokens_out": 0, "tokens_cached_read": 0,
+                "tokens_cached_write": 0}
+        self.conn.execute(
+            "INSERT INTO session_meta (chat_id, thread_id, session_id, name)"
+            " VALUES (?, ?, ?, NULL)",
+            (chat_id, thread_id, meta["session_id"]))
+        self.conn.commit()
+        return meta
+
+    def record_usage(self, chat_id, thread_id, cost, tokens):
+        """Add one call's notional cost + token counts to the accumulators."""
+        self.ensure_meta(chat_id, thread_id)
+        self.conn.execute(
+            "UPDATE session_meta SET cost_usd = cost_usd + ?,"
+            " tokens_in = tokens_in + ?, tokens_out = tokens_out + ?,"
+            " tokens_cached_read = tokens_cached_read + ?,"
+            " tokens_cached_write = tokens_cached_write + ?"
+            " WHERE chat_id=? AND thread_id=?",
+            (float(cost), int(tokens.get("tokens_in") or 0),
+             int(tokens.get("tokens_out") or 0),
+             int(tokens.get("tokens_cached_read") or 0),
+             int(tokens.get("tokens_cached_write") or 0),
+             chat_id, thread_id))
+        self.conn.commit()
 
     # ------------------------------------------------ topics
 

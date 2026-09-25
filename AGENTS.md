@@ -32,8 +32,8 @@ keirai/
 ├── config.py            # Config loading (TOML + env overrides)
 ├── telegram.py          # Telegram Bot API client (raw HTTP, multipart, rich messages, live edits)
 ├── md2tg.py             # Markdown -> Telegram HTML, message splitting
-├── providers.py         # OpenCode Zen/Go clients (blocking + streaming), model stats cache
-├── sessions.py          # SQLite session store (history, models, topics)
+├── providers.py         # OpenCode Zen/Go clients (blocking + streaming), usage capture, models.dev metadata + pricing cache
+├── sessions.py          # SQLite session store (history, models, topics, session meta: ids + cost/token accumulators)
 ├── tools.py             # LLM tool registry: files, shell (blacklist+timeout), dispatch
 ├── websearch.py         # Parallel Search MCP client (free web_search/web_fetch, stdlib HTTP)
 ├── browser.py           # Lightpanda wrapper (optional browse tool, subprocess on demand)
@@ -44,19 +44,20 @@ keirai/
 └── tests/               # Unit tests (unittest, stdlib)
     ├── test_md2tg.py    #   markdown conversion, splitting, rich split, tables, lists
     ├── test_config.py   #   config loading, access control
-    ├── test_providers.py#   provider parsing, cache, multipart, session header
+    ├── test_providers.py#   provider parsing, usage capture, models.dev metadata, cost math, cache, session header
     ├── test_tools.py     #   tool specs, file ops, shell safety/interrupt
     ├── test_websearch.py #   MCP client parsing, handshake, tool args
     ├── test_browser.py   #   lightpanda discovery + subprocess wrapper
     └── test_main.py      #   routing, commands, sessions, streaming, compaction, CLI,
-                          #   tool loop, /stop, reply-to, edit-mode streaming
+                          #   tool loop, /stop, reply-to, edit-mode streaming,
+                          #   /context, /cost, provider fallback, usage accounting
 ```
 
 Run tests: `python -m unittest discover -s tests`
 
 ## Current Status
 
-P0 + P1 + P2 complete and tested (157 tests). The bot does:
+P0 + P1 + P2 + P3 complete and tested (183 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
@@ -70,14 +71,17 @@ P0 + P1 + P2 complete and tested (157 tests). The bot does:
 - Tool rounds run in-turn (max 6 rounds) and are not persisted - only the final answer lands in history
 - `/stop` interrupts a running reply/tool: an update-watcher thread owns getUpdates, intercepts /stop mid-turn, kills running `bash`, and records a neutral "[This run was interrupted by the user...]" marker in context
 - Reply-to/quote context: replies and quoted parts are injected into the prompt as annotations (item 17)
-- Dynamic `/help` built from the command registry; commands registered with `setMyCommands`; OpenCode Go session header (`x-opencode-session`) + `keirai/0.1` user agent
+- Dynamic `/help` built from the command registry; commands registered with `setMyCommands`; anonymized app-wide session header (`x-opencode-session: keirai` - no chat ids leave the machine) + `keirai/0.1` user agent
 - Regular-message fallback path: Markdown -> Telegram HTML rendering with 4096-char splitting (never breaks code blocks; tables as aligned `<pre>`, nested list bullets)
 - `/test_md` (regular pipeline) and `/test_rich` (rich pipeline) for live rendering verification
-- `/models` lists models with auto-fetched stats (context window, costs) from provider APIs, cached on disk; `/model provider/id` switches models
+- `/models` lists models with context/cost stats from **models.dev** (OpenCode's own catalog, daily sync to `cache/models_meta.json`); `/model provider/id` switches models
+- **Go-first inference**: default model `go/mimo-v2.6-flash`; on a provider error the call retries once on the other provider when it has a key AND its catalog serves the model
+- **Usage accounting**: every call's `usage` (blocking + streaming via `stream_options.include_usage`) is accumulated per session in `sessions.db` (`session_meta`: session id `yyyymmdd-hhmm-4hex`, tokens in/out/cached read/cached write, notional cost with cached-read discount)
+- `/context` shows context usage (chars vs limit, auto-compact trigger, session name/id/model, token totals); `/cost` adds the session's notional total cost
 - Photos -> vision models; media round-trip test via caption `media_test`
 - Logging: stderr + `logs/keirai.log` (rotating)
 
-Not implemented yet: P3 (custom OpenAI-compatible providers, interactive setup script) - see TODO.md.
+Not implemented yet: P4 (topic flow & session UX: `/topic`, `/session`, delivery rules, titles) and P5 (custom OpenAI-compatible providers, interactive setup script) - see TODO.md.
 
 ## External Components & Licenses
 

@@ -19,12 +19,14 @@ import time
 import config as config_mod
 import md2tg
 import providers
+import sessions
 import telegram as tg_mod
 import tools as tools_mod
 
 log = logging.getLogger("keirai")
 
 HISTORY_LIMIT = 24  # messages per chat kept in memory
+SESSION_ID = "keirai"  # anonymized x-opencode-session for the whole app (no chat ids)
 TEXT_EXTS = {
     ".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml",
     ".ini", ".cfg", ".sh", ".bat", ".ps1", ".c", ".h", ".cpp", ".hpp", ".rs",
@@ -46,6 +48,8 @@ class State:
         self.thinking = {}   # user_id -> bool
         self.model = {}      # (chat_id, thread) -> "provider/model"
         self.history = {}    # (chat_id, thread) -> [messages]
+        self.meta = {}       # (chat_id, thread) -> {session_id, name, cost, tokens}
+        self.topic_names = {}  # (chat_id, thread_id) -> topic name
         self._turn_lock = threading.Lock()
         self.active_turns = {}   # chat_key -> True while a reply/tool turn runs
         self.interrupts = set()  # chat_keys the user asked to /stop
@@ -81,8 +85,16 @@ class State:
             self.history[key] = messages
             if model:
                 self.model[key] = model
+        for (chat_id, thread_id), m in self.store.load_meta().items():
+            if not m.get("session_id"):
+                m["session_id"] = sessions.new_session_id()
+            self.meta[(chat_id, None if thread_id == 0 else thread_id)] = m
+        for key in list(self.history):
+            if key not in self.meta:  # sessions predating meta (or meta-less)
+                self.ensure_meta(key[0], key[1])
         for chat_id, thread_id, name in self.store.load_topics():
             self.topics.setdefault(chat_id, []).append(thread_id)
+            self.topic_names[(chat_id, thread_id)] = name or ""
         for chat_id, tids in self.topics.items():
             self.session_count[chat_id] = len(tids) + 1
 
@@ -93,6 +105,9 @@ class State:
         key = self.chat_key(chat_id, thread_id)
         self.store.save_session(chat_id, thread_id or 0, self.model.get(key),
                                 self.history.get(key) or [])
+        if not (self.history.get(key) or []):
+            # history wiped -> the session (and its accumulators) is gone
+            self.meta.pop(key, None)
 
     def thinking_on(self, user_id):
         return self.thinking.get(user_id, self._default)
@@ -105,6 +120,32 @@ class State:
 
     def model_for(self, chat_id, thread_id, default_model):
         return self.model.get(self.chat_key(chat_id, thread_id), default_model)
+
+    def ensure_meta(self, chat_id, thread_id):
+        """{session_id, name, cost_usd, tokens_*} for this session (created lazily)."""
+        key = self.chat_key(chat_id, thread_id)
+        m = self.meta.get(key)
+        if m is None:
+            if self.store:
+                m = self.store.ensure_meta(chat_id, thread_id or 0)
+                if not m.get("session_id"):
+                    m["session_id"] = sessions.new_session_id()
+            else:
+                m = {"session_id": sessions.new_session_id(), "name": None,
+                     "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+                     "tokens_cached_read": 0, "tokens_cached_write": 0}
+            self.meta[key] = m
+        return m
+
+    def add_usage(self, chat_id, thread_id, cost, tokens):
+        """Accumulate one provider call's notional cost + token counts."""
+        m = self.ensure_meta(chat_id, thread_id)
+        m["cost_usd"] = (m.get("cost_usd") or 0.0) + float(cost)
+        for k in ("tokens_in", "tokens_out", "tokens_cached_read",
+                  "tokens_cached_write"):
+            m[k] = (m.get(k) or 0) + int(tokens.get(k) or 0)
+        if self.store:
+            self.store.record_usage(chat_id, thread_id or 0, cost, tokens)
 
     def get_history(self, chat_id, thread_id):
         return self.history.setdefault(self.chat_key(chat_id, thread_id), [])
@@ -221,6 +262,10 @@ def cmd_thinking(cfg, tg, msg, thread_id, state):
 @command("models", "list models from configured providers (with context/cost stats)")
 def cmd_models(cfg, tg, msg, thread_id, state):
     lines = []
+    try:  # context/pricing stats come from models.dev (the /models API has none)
+        meta_all, _ = providers.models_metadata(config_mod.cache_dir(cfg))
+    except Exception:
+        meta_all = {}
     for name in ("zen", "go"):
         key = cfg.provider_key(name)
         if not key:
@@ -228,6 +273,13 @@ def cmd_models(cfg, tg, msg, thread_id, state):
             continue
         try:
             models, from_cache = providers.cached_models(name, key, config_mod.cache_dir(cfg))
+            mdata = meta_all.get(name) or {}
+            for m in models:
+                extra = mdata.get(m["id"])
+                if extra:
+                    for field in ("context", "max_output", "cost_in", "cost_out"):
+                        if m.get(field) is None and extra.get(field) is not None:
+                            m[field] = extra[field]
             lines.append("<b>%s</b> (%s, %d models)" % (name, "cached" if from_cache else "fetched", len(models)))
             lines.append(_format_models(models))
         except Exception as e:
@@ -260,8 +312,10 @@ def cmd_new(cfg, tg, msg, thread_id, state):
     chat_id = msg["chat"]["id"]
     name = _arg(msg).strip() or "Session %d" % state.next_session_num(chat_id)
     if not state.topics_enabled:
-        state.history.pop(state.chat_key(chat_id, thread_id), None)
-        state.model.pop(state.chat_key(chat_id, thread_id), None)
+        key = state.chat_key(chat_id, thread_id)
+        state.history.pop(key, None)
+        state.model.pop(key, None)
+        state.meta.pop(key, None)  # fresh session -> fresh session id
         tg.send(chat_id, "topics are not enabled for this bot - "
                          "session cleared here instead. Turn on Threaded mode "
                          "for the bot in the @BotFather Mini App to get one "
@@ -274,6 +328,7 @@ def cmd_new(cfg, tg, msg, thread_id, state):
         return
     tid = topic["message_thread_id"]
     state.topics.setdefault(chat_id, []).append(tid)
+    state.topic_names[(chat_id, tid)] = name
     if state.store:
         state.store.add_topic(chat_id, tid, name)
     log.info("session created: chat=%s topic=%s name=%r", chat_id, tid, name)
@@ -301,6 +356,10 @@ def cmd_reset_all(cfg, tg, msg, thread_id, state):
             del state.history[key]
         for key in [k for k in state.model if k[0] == chat_id]:
             del state.model[key]
+        for key in [k for k in state.meta if k[0] == chat_id]:
+            del state.meta[key]
+        for key in [k for k in state.topic_names if k[0] == chat_id]:
+            del state.topic_names[key]
         state.session_count.pop(chat_id, None)
         state.topics.pop(chat_id, None)
         state.pending_reset.pop(chat_id, None)
@@ -343,6 +402,7 @@ def cmd_rename(cfg, tg, msg, thread_id, state):
         return
     if state.store:
         state.store.set_topic_name(chat_id, thread_id, name)
+    state.topic_names[(chat_id, thread_id)] = name
     tg.send(chat_id, "session renamed to <b>%s</b>" % _esc(name), thread_id)
 
 
@@ -355,6 +415,7 @@ def cmd_delete(cfg, tg, msg, thread_id, state):
     had = bool(state.history.get(key))
     state.history.pop(key, None)
     state.model.pop(key, None)
+    state.meta.pop(key, None)  # cost/token accumulators die with the session
     if state.store:
         state.store.delete_session(chat_id, thread_id or 0)
     log.info("session deleted: chat=%s thread=%s (had_history=%s)", chat_id, thread_id, had)
@@ -384,17 +445,63 @@ def cmd_compact(cfg, tg, msg, thread_id, state):
         return
     tg.typing(chat_id, thread_id)
     before_n, before_chars = len(history), _est_chars(history)
+    cusage = {}
     try:
         history[:] = _compact(cfg, provider, api_key, model_id, history,
-                              "compact-%s-%s" % (chat_id, thread_id or "main"))
+                              SESSION_ID, usage_out=cusage)
     except Exception as e:
         _err(tg, msg, thread_id, "compaction failed: %s" % e)
         return
+    _record_usage(cfg, state, chat_id, thread_id, cusage, provider, model_id)
     state.persist(chat_id, thread_id)
     log.info("manual compact: chat=%s thread=%s %d->%d msgs", chat_id, thread_id,
              before_n, len(history))
     tg.send(chat_id, "compacted: %d -> %d messages (%d -> %d chars)"
             % (before_n, len(history), before_chars, _est_chars(history)), thread_id)
+
+
+@command("context", "context window usage of this session (name/id/model, tokens)")
+def cmd_context(cfg, tg, msg, thread_id, state):
+    chat_id = msg["chat"]["id"]
+    tg.send(chat_id, _session_report(cfg, state, chat_id, thread_id, False),
+            thread_id)
+
+
+@command("cost", "cost of this session: tokens in/out/cached + total")
+def cmd_cost(cfg, tg, msg, thread_id, state):
+    chat_id = msg["chat"]["id"]
+    tg.send(chat_id, _session_report(cfg, state, chat_id, thread_id, True),
+            thread_id)
+
+
+def _session_report(cfg, state, chat_id, thread_id, with_cost):
+    """Shared body of /context and /cost (group 21)."""
+    key = state.chat_key(chat_id, thread_id)
+    history = state.history.get(key) or []
+    chars = _est_chars(history)
+    limit = cfg.context_limit_chars
+    meta = state.ensure_meta(chat_id, thread_id)
+    model = state.model_for(chat_id, thread_id, cfg.default_model)
+    name = state.topic_names.get(key) or meta.get("name") or "session"
+    pct = int(round(chars * 100.0 / limit)) if limit else 0
+    would_compact = chars > limit and len(history) > 6
+    lines = [
+        "<b>session</b>: %s · <code>%s</code>"
+        % (_esc(str(name)), _esc(str(meta.get("session_id") or "?"))),
+        "<b>model</b>: <code>%s</code>" % _esc(model),
+        "<b>context</b>: %s / %s chars (%d%%) · %d messages"
+        % ("{:,}".format(chars), "{:,}".format(limit), pct, len(history)),
+        "auto-compact: <b>%s</b>" % (
+            "would trigger now" if would_compact
+            else "not yet (triggers over %s chars)" % "{:,}".format(limit)),
+        "<b>tokens</b>: in %s · out %s · cached read %s · cached write %s"
+        % tuple("{:,}".format(int(meta.get(k) or 0)) for k in
+                ("tokens_in", "tokens_out", "tokens_cached_read",
+                 "tokens_cached_write")),
+    ]
+    if with_cost:
+        lines.append("<b>cost</b>: $%.6f" % (meta.get("cost_usd") or 0.0))
+    return "\n".join(lines)
 
 
 def _format_models(models):
@@ -428,6 +535,40 @@ def _resolve_provider(cfg, model_full):
     return provider_name, api_key, model_id
 
 
+def _alternate_provider(cfg, provider_name, model_id):
+    """(other_provider, key) when the OTHER provider has a key AND its catalog
+    serves the same model id; None otherwise (never blind-retry a model)."""
+    alt = "go" if provider_name != "go" else "zen"
+    key = cfg.provider_key(alt)
+    if not key:
+        return None
+    try:
+        models, _ = providers.cached_models(alt, key, config_mod.cache_dir(cfg))
+    except Exception:
+        return None  # unknown catalog -> no fallback (spec: iff it serves it)
+    return (alt, key) if any(m.get("id") == model_id for m in models) else None
+
+
+def _record_usage(cfg, state, chat_id, thread_id, usage, provider, model_id):
+    """Accumulate one call's tokens + notional cost into the session (P3)."""
+    if not usage:
+        return
+    try:
+        price = providers.price_for(config_mod.cache_dir(cfg), provider, model_id)
+        cost = providers.usage_cost(price, usage)
+    except Exception:
+        cost = 0.0
+    details = usage.get("prompt_tokens_details") or {}
+    tin = int(usage.get("prompt_tokens") or 0)
+    cached = int(details.get("cached_tokens") or 0)
+    state.add_usage(chat_id, thread_id, cost, {
+        "tokens_in": tin,
+        "tokens_out": int(usage.get("completion_tokens") or 0),
+        "tokens_cached_read": max(0, min(cached, tin)),
+        "tokens_cached_write": 0,  # never reported by the endpoints
+    })
+
+
 def _est_chars(history):
     n = 0
     for m in history:
@@ -441,7 +582,8 @@ def _est_chars(history):
     return n
 
 
-def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4):
+def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4,
+             usage_out=None):
     """Summarize the older part of history, keep the last `keep` messages.
     Returns the new message list."""
     tail = list(history[-keep:]) if len(history) > keep else list(history)
@@ -461,7 +603,8 @@ def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4):
               + "\n".join(transcript))
     summary, _reasoning, _tcs = providers.chat(provider, api_key, model_id,
                                                [{"role": "user", "content": prompt}],
-                                               session_id=session_id)
+                                               session_id=session_id,
+                                               usage_out=usage_out)
     marker = [
         {"role": "user", "content": "[Summary of earlier conversation]\n" + summary},
         {"role": "assistant", "content": "Understood. Continuing with that context."},
@@ -499,7 +642,7 @@ def _flush_live(tg, live, chat_id, thread_id, reasoning, answer, show_reasoning)
 
 
 def _stream_answer(tg, msg, live, stop, provider, api_key, model_id, messages,
-                   session_id, tools=None, thread_id=None):
+                   session_id, tools=None, thread_id=None, usage_out=None):
     """Stream one provider round with live progress.
     Returns (answer, reasoning, tool_calls). Raises on provider failure.
     `stop()` is checked every delta so /stop cuts generation short."""
@@ -508,7 +651,8 @@ def _stream_answer(tg, msg, live, stop, provider, api_key, model_id, messages,
     show_reasoning = True  # until first content token arrives
     last_flush = 0.0
     for kind, delta in providers.chat_stream(provider, api_key, model_id, messages,
-                                             session_id=session_id, tools=tools):
+                                             session_id=session_id, tools=tools,
+                                             usage_out=usage_out):
         if kind == "tool_calls":
             return answer, reasoning, delta
         if kind == "reasoning" and show_reasoning:
@@ -557,7 +701,33 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         _err(tg, msg, thread_id, "no API key for provider '%s' (or fallback 'go'/'zen')"
              % provider_name)
         return
-    session_id = "keirai-%s-%s" % (chat_id, thread_id or "main")
+    session_id = SESSION_ID  # anonymized app-wide constant (no chat ids)
+    switched = {"on": False}
+
+    def pcall(messages, tools=None):
+        """Provider call with Go-first error fallback (group 25): on
+        ProviderError, retry once via the other provider when it has a key
+        AND its catalog serves this model id. Usage is recorded on success."""
+        nonlocal provider_name, api_key
+        while True:
+            usage = {}
+            try:
+                result = providers.chat(provider_name, api_key, model_id,
+                                        messages, session_id=session_id,
+                                        tools=tools, usage_out=usage)
+            except providers.ProviderError as e:
+                alt = (None if switched["on"]
+                       else _alternate_provider(cfg, provider_name, model_id))
+                if alt is None:
+                    raise
+                switched["on"] = True
+                log.warning("provider '%s' failed (%s) - retrying via '%s'",
+                            provider_name, e, alt[0])
+                provider_name, api_key = alt
+                continue
+            _record_usage(cfg, state, chat_id, thread_id, usage,
+                          provider_name, model_id)
+            return result
 
     content = [{"type": "text", "text": text or "Describe the image."}]
     for mime, b64 in images or []:
@@ -570,9 +740,12 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     # auto-compact before the context limit is hit
     if not stop() and _est_chars(history) > cfg.context_limit_chars and len(history) > 6:
         before = len(history)
+        cusage = {}
         try:
             history[:] = _compact(cfg, provider_name, api_key, model_id, history,
-                                  session_id)
+                                  session_id, usage_out=cusage)
+            _record_usage(cfg, state, chat_id, thread_id, cusage,
+                          provider_name, model_id)
             log.info("auto-compact: chat=%s thread=%s %d -> %d msgs",
                      chat_id, thread_id, before, len(history))
         except Exception as e:
@@ -595,20 +768,21 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             break
         tcs, got = None, False
         if live:
+            susage = {}
             try:
                 answer, reasoning, tcs = _stream_answer(
                     tg, msg, live, stop, provider_name, api_key, model_id,
                     messages, session_id, tools=tool_specs or None,
-                    thread_id=thread_id)
+                    thread_id=thread_id, usage_out=susage)
                 got = True
             except Exception as e:
                 log.warning("streaming failed (%s) - falling back to blocking call", e)
+            _record_usage(cfg, state, chat_id, thread_id, susage,
+                          provider_name, model_id)
         if not got and not stop():
             tg.typing(chat_id, thread_id)
             try:
-                answer, reasoning, tcs = providers.chat(
-                    provider_name, api_key, model_id, messages,
-                    session_id=session_id, tools=tool_specs or None)
+                answer, reasoning, tcs = pcall(messages, tools=tool_specs or None)
             except Exception as e:
                 history.pop()  # don't keep failed turns
                 state.persist(chat_id, thread_id)
@@ -656,8 +830,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         # round cap hit (or empty answer): final call, tools off
         tg.typing(chat_id, thread_id)
         try:
-            answer, reasoning, _ = providers.chat(provider_name, api_key, model_id,
-                                                  messages, session_id=session_id)
+            answer, reasoning, _ = pcall(messages)
         except Exception as e:
             history.pop()
             state.persist(chat_id, thread_id)
@@ -971,7 +1144,6 @@ def main():
         log.error("copy config.example.toml to config.toml and set bot_token")
         sys.exit(1)
 
-    import sessions
     store = sessions.Store(config_mod.sessions_path(cfg))
     tg = tg_mod.Telegram(cfg.bot_token)
     state = State(cfg.thinking_default, store=store)

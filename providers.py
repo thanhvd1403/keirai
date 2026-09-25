@@ -2,8 +2,9 @@
 
 - Zen:  https://opencode.ai/zen/v1
 - Go:   https://opencode.ai/zen/go/v1
-Both expose GET /models (model list + metadata) and POST /chat/completions.
-Model stats (context window, costs) are fetched from /models and cached on disk.
+Both expose GET /models (ids only) and POST /chat/completions.
+Model metadata (context window, pricing) comes from models.dev - OpenCode's
+own catalog - fetched daily and cached on disk (see models_metadata()).
 """
 import json
 import os
@@ -18,6 +19,12 @@ PROVIDER_BASES = {
 CACHE_TTL = 24 * 60 * 60  # refresh stats daily
 CHAT_TIMEOUT = 300
 
+# models.dev (OpenCode's own model catalog) - daily metadata sync
+MODELS_DEV_URL = "https://models.dev/api.json"
+META_TTL = 24 * 60 * 60
+META_PROVIDER_KEYS = {"zen": "opencode", "go": "opencode-go"}
+_meta_memo = {}  # cache path -> (fetched_at, meta)
+
 
 class ProviderError(Exception):
     pass
@@ -29,7 +36,7 @@ def _request(url, api_key, payload=None, timeout=30, session_id=None):
     headers = {"Authorization": "Bearer %s" % api_key, "User-Agent": "keirai/0.1"}
     if session_id:
         # OpenCode Go requires a stable per-conversation session id
-        # (https://opencode.ai/docs/go/#where-can-i-use-it)
+        # (https://opencode.ai/docs/go/#where-can-i-use-it); Zen caches on it too
         headers["x-opencode-session"] = session_id
     if payload is not None:
         headers["Content-Type"] = "application/json"
@@ -43,6 +50,19 @@ def _request(url, api_key, payload=None, timeout=30, session_id=None):
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
         raise ProviderError("HTTP %d from %s: %s" % (e.code, url, body[:300]))
+    except urllib.error.URLError as e:
+        raise ProviderError("%s: %s" % (url, e.reason))
+
+
+def _get_json(url, timeout=60):
+    """Anonymous GET -> parsed JSON. Raises ProviderError on failure."""
+    req = urllib.request.Request(url, headers={"User-Agent": "keirai/0.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        raise ProviderError("HTTP %d from %s: %s" % (e.code, url, body[:200]))
     except urllib.error.URLError as e:
         raise ProviderError("%s: %s" % (url, e.reason))
 
@@ -146,14 +166,122 @@ def cached_models(name, api_key, cache_dir, force_refresh=False):
     return models, False
 
 
+# -------------------------------------------------- models.dev metadata
+# The live /models endpoint returns ids only, so context/pricing/capability
+# data comes from models.dev (OpenCode's own catalog, used by opencode itself).
+
+def parse_metadata(blob):
+    """models.dev api.json -> {provider: {model_id: stats}} for OUR providers.
+
+    stats: {context, max_output, cost_in, cost_out, cost_cache_read,
+    cost_cache_write, image} - costs are USD per 1M tokens, None when absent.
+    """
+    out = {}
+    if not isinstance(blob, dict):
+        return out
+    for ours, theirs in META_PROVIDER_KEYS.items():
+        entry = blob.get(theirs)
+        if not isinstance(entry, dict):
+            continue
+        rows = {}
+        for mid, m in (entry.get("models") or {}).items():
+            if not isinstance(m, dict):
+                continue
+            cost = m.get("cost") if isinstance(m.get("cost"), dict) else {}
+            limit = m.get("limit") if isinstance(m.get("limit"), dict) else {}
+            modal = m.get("modalities") if isinstance(m.get("modalities"), dict) else {}
+            rows[mid] = {
+                "context": limit.get("context"),
+                "max_output": limit.get("output"),
+                "cost_in": cost.get("input"),
+                "cost_out": cost.get("output"),
+                "cost_cache_read": cost.get("cache_read"),
+                "cost_cache_write": cost.get("cache_write"),
+                "image": "image" in (modal.get("input") or []),
+            }
+        out[ours] = rows
+    return out
+
+
+def models_metadata(cache_dir, force=False):
+    """(meta, from_cache) - daily models.dev sync into a compact derived cache.
+
+    One ~4.9 MB fetch per day, reduced to just our two providers (a few KB)
+    and written to cache/models_meta.json; returns ({}, ...) on total failure
+    so callers degrade instead of raising.
+    """
+    path = os.path.join(cache_dir, "models_meta.json")
+    now = time.time()
+
+    def _read_cache():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+            return blob.get("fetched_at", 0), blob.get("meta") or {}
+        except (ValueError, OSError):
+            return 0, {}
+
+    memo = _meta_memo.get(path)
+    if memo and not force and now - memo[0] < META_TTL:
+        return memo[1], True
+    if not force and os.path.isfile(path):
+        fetched_at, meta = _read_cache()
+        if now - fetched_at < META_TTL:
+            _meta_memo[path] = (fetched_at, meta)
+            return meta, True
+    try:
+        meta = parse_metadata(_get_json(MODELS_DEV_URL))
+    except ProviderError:
+        fetched_at, meta = _read_cache()  # stale beats nothing
+        if meta:
+            _meta_memo[path] = (fetched_at, meta)
+        return meta, True
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"fetched_at": now, "meta": meta}, f)
+    except OSError:
+        pass
+    _meta_memo[path] = (now, meta)
+    return meta, False
+
+
+def price_for(cache_dir, provider, model_id):
+    """Per-1M pricing stats for one model, or None when unknown."""
+    meta, _ = models_metadata(cache_dir)
+    return (meta.get(provider) or {}).get(model_id)
+
+
+def usage_cost(price, usage):
+    """Notional USD for one call's `usage` at models.dev per-1M rates.
+
+    Cached reads use the cheaper cache_read rate when available; cache-write
+    tokens are not reported by the API and stay inside prompt_tokens at the
+    input rate. Returns 0.0 when pricing or usage is missing.
+    """
+    if not price or not isinstance(usage, dict):
+        return 0.0
+    tin = int(usage.get("prompt_tokens") or 0)
+    tout = int(usage.get("completion_tokens") or 0)
+    details = usage.get("prompt_tokens_details") or {}
+    cached = int(details.get("cached_tokens") or 0)
+    cached = max(0, min(cached, tin))
+    rate_in = float(price.get("cost_in") or 0.0)
+    rate_cached = float(price.get("cost_cache_read") or price.get("cost_in") or 0.0)
+    rate_out = float(price.get("cost_out") or 0.0)
+    return ((tin - cached) * rate_in + cached * rate_cached + tout * rate_out) / 1_000_000.0
+
+
 # ---------------------------------------------------------------- chat
 
-def chat(name, api_key, model, messages, extra=None, session_id=None, tools=None):
+def chat(name, api_key, model, messages, extra=None, session_id=None, tools=None,
+         usage_out=None):
     """One chat completion. Returns (content, reasoning, tool_calls).
 
     tool_calls: [{"id", "name", "arguments"(dict)}] or None.
-    session_id: stable per-conversation id, required by OpenCode Go
-    (sent as x-opencode-session header).
+    session_id: stable id sent as x-opencode-session (Go requires it; Zen
+    pins its cache-affine instance with it).
+    usage_out: optional dict - filled with the response `usage` (token counts)
+    for cost accounting.
     """
     base = PROVIDER_BASES.get(name)
     if not base:
@@ -165,6 +293,8 @@ def chat(name, api_key, model, messages, extra=None, session_id=None, tools=None
         payload.update(extra)
     resp = _request(base + "/chat/completions", api_key, payload=payload,
                     timeout=CHAT_TIMEOUT, session_id=session_id)
+    if usage_out is not None and isinstance(resp.get("usage"), dict):
+        usage_out.update(resp["usage"])
     try:
         msg = resp["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
@@ -198,17 +328,21 @@ def parse_tool_calls(raw):
     return out or None
 
 
-def chat_stream(name, api_key, model, messages, session_id=None, tools=None):
+def chat_stream(name, api_key, model, messages, session_id=None, tools=None,
+                usage_out=None):
     """Streaming chat completion.
 
     Yields ("reasoning"|"content", delta_text) while generating and, when the
     model called tools, a final ("tool_calls", [...]) before stopping.
     OpenAI-compatible SSE (stream: true). Raises ProviderError on failure.
+    usage_out (optional dict) receives the final `usage` token counts - sent
+    with stream_options.include_usage and captured from any chunk carrying it.
     """
     base = PROVIDER_BASES.get(name)
     if not base:
         raise ProviderError("unknown provider: %s" % name)
-    payload = {"model": model, "messages": messages, "stream": True}
+    payload = {"model": model, "messages": messages, "stream": True,
+               "stream_options": {"include_usage": True}}
     if tools:
         payload["tools"] = tools
     headers = {"Authorization": "Bearer %s" % api_key, "User-Agent": "keirai/0.1",
@@ -237,6 +371,9 @@ def chat_stream(name, api_key, model, messages, session_id=None, tools=None):
                 obj = json.loads(data)
             except ValueError:
                 continue
+            u = obj.get("usage")
+            if usage_out is not None and isinstance(u, dict):
+                usage_out.update(u)
             choices = obj.get("choices") or []
             if not choices:
                 continue

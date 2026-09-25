@@ -248,9 +248,10 @@ class TestSessions(unittest.TestCase):
             user_texts = [m["content"] for m in call[0][3]
                           if m.get("role") == "user"]
             self.assertEqual(user_texts, [own])
-        # distinct x-opencode-session per topic (no shared provider session)
+        # one anonymized app-wide x-opencode-session (no chat/topic ids leave
+        # the machine) - isolation is by payload content, asserted above
         sids = {call[1]["session_id"] for call in chat_mock.call_args_list}
-        self.assertEqual(len(sids), 3)
+        self.assertEqual(sids, {main.SESSION_ID})
 
     @mock.patch.object(providers, "chat", return_value=("fresh", "", None))
     def test_manually_created_topic_gets_fresh_session(self, chat_mock):
@@ -813,6 +814,217 @@ class TestEditStreaming(unittest.TestCase):
         # live edits failed -> placeholder dropped, answer sent fresh
         self.assertTrue(tg.deleted)
         self.assertIn({"markdown": "answer text"}, [s for _c, s, _t in tg.rich])
+
+
+class TestProviderPriority(unittest.TestCase):
+    """P3: Go-first default + catalog-checked error fallback (group 25)."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        self.cfg = make_config()
+
+    def test_default_model_is_go(self):
+        self.assertEqual(make_config().default_model, "go/mimo-v2.6-flash")
+
+    @mock.patch.object(main, "_alternate_provider", return_value=("zen", "zk"))
+    @mock.patch.object(providers, "chat")
+    def test_provider_error_falls_back_once(self, chat_mock, alt_mock):
+        chat_mock.side_effect = [providers.ProviderError("boom"),
+                                 ("recovered", "", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        self.assertEqual(chat_mock.call_args_list[0][0][0], "go")   # go first
+        self.assertEqual(chat_mock.call_args_list[1][0][0], "zen")  # then zen
+        self.assertTrue(any(s[1].get("markdown") == "recovered"
+                            for s in self.tg.rich))
+
+    @mock.patch.object(main, "_alternate_provider", return_value=None)
+    @mock.patch.object(providers, "chat",
+                       side_effect=providers.ProviderError("boom"))
+    def test_error_without_alternate_is_reported(self, chat_mock, alt_mock):
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        self.assertTrue(any("error" in t for _c, t, _t in self.tg.sent))
+
+    def test_alternate_requires_key_and_catalog_entry(self):
+        # catalog has the model -> usable alternate
+        with mock.patch.object(providers, "cached_models",
+                               return_value=([{"id": "glm-5.3-flash"}], False)):
+            self.assertEqual(main._alternate_provider(self.cfg, "zen", "glm-5.3-flash"),
+                             ("go", "gk"))
+            self.assertIsNone(main._alternate_provider(self.cfg, "zen", "other"))
+        # catalog unreachable -> never blind-retry
+        with mock.patch.object(providers, "cached_models",
+                               side_effect=providers.ProviderError("down")):
+            self.assertIsNone(main._alternate_provider(self.cfg, "zen", "glm-5.3-flash"))
+        # no key on the alternate -> no fallback
+        nokey = make_config(providers={"zen": {"api_key": "zk"}, "go": {"api_key": ""}})
+        self.assertIsNone(main._alternate_provider(nokey, "zen", "glm-5.3-flash"))
+
+
+class TestUsageAccounting(unittest.TestCase):
+    """P3: token/cost accumulation per session (group 21)."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        self.cfg = make_config()
+
+    @mock.patch.object(providers, "price_for")
+    @mock.patch.object(providers, "chat")
+    def test_usage_and_cost_accumulate(self, chat_mock, price_mock):
+        price_mock.return_value = {"cost_in": 0.15, "cost_out": 0.5,
+                                   "cost_cache_read": 0.03}
+
+        def fake(*args, **kw):
+            kw["usage_out"].update({
+                "prompt_tokens": 1000, "completion_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 500}})
+            return ("answer", "", None)
+
+        chat_mock.side_effect = fake
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        m = self.state.meta[(100, None)]
+        self.assertEqual(m["tokens_in"], 1000)
+        self.assertEqual(m["tokens_out"], 100)
+        self.assertEqual(m["tokens_cached_read"], 500)
+        self.assertEqual(m["tokens_cached_write"], 0)
+        self.assertAlmostEqual(m["cost_usd"],
+                               (500 * 0.15 + 500 * 0.03 + 100 * 0.5) / 1e6)
+        self.assertRegex(m["session_id"], r"^\d{8}-\d{4}-[0-9a-f]{4}$")
+        # keeps accumulating across turns
+        main.handle_message(self.cfg, self.tg, msg(text="again"), self.state)
+        self.assertEqual(self.state.meta[(100, None)]["tokens_in"], 2000)
+        self.assertAlmostEqual(self.state.meta[(100, None)]["cost_usd"],
+                               2 * (500 * 0.15 + 500 * 0.03 + 100 * 0.5) / 1e6)
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_missing_pricing_counts_tokens_only(self, chat_mock, price_mock):
+        def fake(*args, **kw):
+            kw["usage_out"].update({"prompt_tokens": 500,
+                                    "completion_tokens": 50})
+            return ("a", "", None)
+
+        chat_mock.side_effect = fake
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        m = self.state.meta[(100, None)]
+        self.assertEqual(m["tokens_in"], 500)   # tokens still counted
+        self.assertEqual(m["cost_usd"], 0.0)    # but no price -> no cost
+
+
+class TestContextCostCommands(unittest.TestCase):
+    """P3: /context and /cost (group 21)."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        self.cfg = make_config()
+
+    @mock.patch.object(providers, "chat", return_value=("a", "", None))
+    def test_context_shows_usage_without_cost(self, _):
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        self.tg.sent.clear()
+        main.handle_message(self.cfg, self.tg, msg(text="/context"), self.state)
+        text = self.tg.sent[-1][1]
+        self.assertIn("<b>session</b>", text)
+        self.assertIn("<b>model</b>", text)
+        self.assertIn("<b>context</b>", text)
+        self.assertIn("<b>tokens</b>", text)
+        self.assertIn("auto-compact:", text)
+        self.assertNotIn("<b>cost</b>", text)
+        self.assertRegex(text, r"\d{8}-\d{4}-[0-9a-f]{4}")
+
+    def test_cost_adds_cost_line_and_context_block(self):
+        main.handle_message(self.cfg, self.tg, msg(text="/cost"), self.state)
+        text = self.tg.sent[-1][1]
+        self.assertIn("<b>cost</b>: $", text)
+        self.assertIn("<b>tokens</b>", text)
+        self.assertIn("<b>context</b>", text)
+        self.assertIn("<b>model</b>", text)
+
+
+class TestModelsStats(unittest.TestCase):
+    """P3: /models stats come from models.dev (the API returns ids only)."""
+
+    @mock.patch.object(providers, "models_metadata")
+    @mock.patch.object(providers, "cached_models")
+    def test_models_merges_metadata(self, cm_mock, mm_mock):
+        cm_mock.return_value = ([{"id": "glm-5.3-flash", "context": None,
+                                  "cost_in": None, "cost_out": None,
+                                  "max_output": None}], False)
+        mm_mock.return_value = ({"zen": {"glm-5.3-flash": {
+                                    "context": 1000000, "cost_in": 0.15,
+                                    "cost_out": 0.5, "max_output": 131072}},
+                                 "go": {}}, False)
+        tg = FakeTG()
+        main.handle_message(make_config(), tg, msg(text="/models"), main.State(True))
+        text = tg.sent[0][1]
+        self.assertIn("ctx ", text)
+        self.assertIn("$0.15/", text)
+        self.assertIn("per 1M", text)
+
+
+class TestSessionMeta(unittest.TestCase):
+    """sessions.db session_meta: ids + accumulators + backfill."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self._dir.name, "meta.db")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_new_session_id_format(self):
+        import sessions
+        self.assertRegex(sessions.new_session_id(1790000000),
+                         r"^\d{8}-\d{4}-[0-9a-f]{4}$")
+
+    def test_meta_lifecycle(self):
+        import sessions
+        store = sessions.Store(self.db)
+        meta = store.ensure_meta(100, 0)
+        self.assertRegex(meta["session_id"], r"^\d{8}-\d{4}-[0-9a-f]{4}$")
+        store.record_usage(100, 0, 0.25, {"tokens_in": 10, "tokens_out": 5,
+                                          "tokens_cached_read": 2,
+                                          "tokens_cached_write": 0})
+        store.record_usage(100, 0, 0.25, {"tokens_in": 1, "tokens_out": 0,
+                                          "tokens_cached_read": 0,
+                                          "tokens_cached_write": 0})
+        got = store.load_meta()[(100, 0)]
+        self.assertAlmostEqual(got["cost_usd"], 0.5)
+        self.assertEqual(got["tokens_in"], 11)
+        self.assertEqual(got["tokens_cached_read"], 2)
+        # survives history REPLACE + process restart
+        store.save_session(100, 0, None, [{"role": "user", "content": "x"}])
+        store.close()
+        store2 = sessions.Store(self.db)
+        got2 = store2.load_meta()[(100, 0)]
+        self.assertEqual(got2["session_id"], meta["session_id"])
+        self.assertAlmostEqual(got2["cost_usd"], 0.5)
+        # deleting the session clears its meta too
+        store2.delete_session(100, 0)
+        self.assertEqual(store2.load_meta(), {})
+        store2.close()
+
+    def test_backfill_gives_existing_sessions_ids(self):
+        import sessions
+        store = sessions.Store(self.db)
+        store.save_session(7, 0, None, [{"role": "user", "content": "old"}])
+        self.assertEqual(store.load_meta(), {})  # pre-meta session: no row yet
+        store.close()
+        store2 = sessions.Store(self.db)  # reopen -> backfill runs
+        meta = store2.load_meta()[(7, 0)]
+        self.assertRegex(meta["session_id"], r"^\d{8}-\d{4}-[0-9a-f]{4}$")
+        store2.close()
+
+    def test_delete_chat_clears_meta(self):
+        import sessions
+        store = sessions.Store(self.db)
+        store.ensure_meta(5, 0)
+        store.ensure_meta(5, 9)
+        store.delete_chat(5)
+        self.assertEqual(store.load_meta(), {})
+        store.close()
 
 
 if __name__ == "__main__":

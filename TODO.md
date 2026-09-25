@@ -155,37 +155,37 @@
   - Partial live message (edit mode) is deleted; user gets "stopped - the running reply/tool was interrupted"
   - Idle `/stop` replies "nothing is running right now"
 
-## P3 - Provider Foundation: Metadata, Priority & Cost
+## P3 - Provider Foundation: Metadata, Priority & Cost (complete)
 
 > Everything providers.py / config / sessions.db level. No Telegram UX beyond
 > two new read-only commands. Specs live in groups 25 + 21.
 
 **Implementation points (in order):**
-1. [ ] `providers.py`: capture **`usage`** from every call - blocking responses (`usage` object, currently discarded) and streaming (`stream_options: {"include_usage": true}` + the final `"choices": []` chunk, currently skipped) - and return it to callers
-2. [ ] Swap the `x-opencode-session` header value to the **anonymized app-wide constant `keirai`** (no chat ids leave the machine; per-prefix cache hits unaffected - group 21)
-3. [ ] **models.dev daily sync** (group 25): one `api.json` fetch/24h -> extract `opencode` + `opencode-go` -> compact derived cache; rewire the `/models` stats display to it (fixes the dead normalization)
-4. [ ] **Go-first priority** (group 25): built-in `default_model` -> `go/mimo-v2.6-flash`; catalog-checked error fallback in `_resolve_provider`
-5. [ ] sessions.db: add **`session_id`** column (`yyyymmdd-hhmm-4hex`, assigned at creation, backfill existing rows) + accumulator columns **`cost_usd`, `tokens_in`, `tokens_out`, `tokens_cached_read`, `tokens_cached_write`** (cleared by `/delete`)
-6. [ ] **`/context`** command (group 21): chars vs limit, message count, auto-compact trigger + session name/id/model + token totals
-7. [ ] **`/cost`** command (group 21): the context block + notional cost (cached-read discount applied) + token totals
-8. [ ] Tests for each (usage capture both paths, pricing math, fallback routing, command output) + docs (`config.example.toml`, AGENTS.md)
+1. [x] `providers.py`: capture **`usage`** from every call - blocking responses (`usage` object, previously discarded) and streaming (`stream_options: {"include_usage": true}` + the usage-carrying chunk, whether `"choices": []` on Zen or attached to a choice chunk on Go) - via a `usage_out` dict handed to callers
+2. [x] Swap the `x-opencode-session` header value to the **anonymized app-wide constant `keirai`** (`main.SESSION_ID`; no chat ids leave the machine, also passed to tool ctx - per-prefix cache hits unaffected)
+3. [x] **models.dev daily sync** (group 25): one `api.json` fetch/24h -> extract `opencode` + `opencode-go` -> compact `cache/models_meta.json`; `/models` stats display now merges from it (the dead `/models` normalization stays as fallback)
+4. [x] **Go-first priority** (group 25): built-in `default_model` -> `go/mimo-v2.6-flash`; `_alternate_provider()` + `pcall()` in `_ai_reply` - on `ProviderError` retry once via the other provider iff it has a key AND its catalog serves the model id
+5. [x] sessions.db: new **`session_meta` table** (separate from `sessions` so the history REPLACE can't wipe it): `session_id` (`yyyymmdd-hhmm-4hex`, assigned at creation, **backfilled** for pre-existing rows), `name`, **`cost_usd`, `tokens_in`, `tokens_out`, `tokens_cached_read`, `tokens_cached_write`** (cleared together with the session by `/delete`/`/reset-all`)
+6. [x] **`/context`** command (group 21): chars vs limit, message count, auto-compact trigger + session name/id/model + token totals
+7. [x] **`/cost`** command (group 21): the context block + notional cost (cached-read discount applied) + token totals
+8. [x] Tests for each (24 new: usage capture both paths, metadata parse/cache, cost math, fallback routing, command output, meta lifecycle/backfill) + docs (`config.example.toml`, AGENTS.md)
 
 ### 25. Model metadata (models.dev) & Go-first priority
 *(moved here from P0 group 5 - was outstanding inside a completed phase)*
 
-- [ ] **Model metadata sync from models.dev** (the price/context source; decision 2026-09-25)
+- [x] **Model metadata sync from models.dev** (the price/context source; decision 2026-09-25)
   - models.dev (`https://models.dev/api.json`) is OpenCode's own database (GitHub `anomalyco/models.dev` - "we use it internally in opencode") and is what OpenCode itself uses for pricing + context limits (V2 docs: "OpenCode includes a provider and model catalog from models.dev")
   - Verified live: providers **`opencode`** (= zen, `https://opencode.ai/zen/v1`, 113 models) and **`opencode-go`** (41 models) with `cost {input, output, cache_read}` per 1M, `limit {context, output}` and `modalities` (image input = vision detection) - e.g. `glm-5.3-flash`: $0.15/$0.50, ctx 1M, exactly matching the docs pricing table
   - Fetch: **daily** (24h TTL, same pattern as the models cache) - one `GET https://models.dev/api.json` (~4.9 MB; no per-provider endpoint exists, SPA swallows path guesses, repo per-model TOMLs would need 154 file fetches > unauth GitHub rate limit) -> extract just the two providers into a **compact derived cache** (few KB), discard the payload; transient parse spike of tens of MB, within the memory budget
   - Feeds: `/cost` price table (group 21), `/models` stats display (fixes the dead normalization), vision-capability detection (group 19 media naming)
   - Checked per request: Hermes Agent (`NousResearch/hermes-agent`) resolves **context length** via a multi-source chain ending at models.dev and only picks up pricing opportunistically from `/models` payloads - models.dev gives us both cost AND context in one place
-- [ ] **Go-first inference priority** (decisions 2026-09-25): infer on the **Go** key first, use **Zen** as a fallback
+- [x] **Go-first inference priority** (decisions 2026-09-25): infer on the **Go** key first, use **Zen** as a fallback
   - **Option (a) chosen**: built-in `default_model` flips to **`go/mimo-v2.6-flash`**; PLUS runtime error-fallback - on `ProviderError` from the primary provider, retry once on the other provider's endpoint **iff** it has a key **AND its catalog serves the same model id** (checked against the cached model list - never blind-retry `zen/gpt-5.2` on go); an explicit `/model zen/...` still starts on zen (and falls back to go on error)
   - Replaces current behavior: `_resolve_provider` routes by model prefix only; key-missing falls back to the other provider (prefer go); built-in default was `zen/glm-5.3-flash` -> with both keys present the default landed on **zen**
 
 ### 21. /context and /cost commands
-- [ ] `/context` shows the current context window usage of the session: chars used vs `context_limit_chars`, message count, whether an auto-compact would trigger - plus **session name, session id, active model**
-- [ ] `/cost` (new): same context block (used vs limit + the auto-compact trigger point) **+ total cost of this session**, plus session name, session id, active model
+- [x] `/context` shows the current context window usage of the session: chars used vs `context_limit_chars`, message count, whether an auto-compact would trigger - plus **session name, session id, active model**
+- [x] `/cost` (new): same context block (used vs limit + the auto-compact trigger point) **+ total cost of this session**, plus session name, session id, active model
   - Cost research - **live-probed 2026-09-25** (service-account key; zen blocking + streaming, go, V2 inference): **no cost field anywhere** - not in the JSON body, not in response headers -> **sum locally**: capture `usage` after every API call, multiply by price
     - Blocking: standard `usage` object (returned today, currently discarded); Go additionally reports `prompt_tokens_details.cached_tokens` + `completion_tokens_details.reasoning_tokens`, zen's `prompt_tokens_details` comes back empty on cache misses
     - Streaming: `stream_options: {"include_usage": true}` is accepted; the final chunk before `[DONE]` has `"choices": []` + `usage` (chunks without `choices` are skipped today - must be captured)
@@ -199,7 +199,7 @@
     - Tiered models (`context_over_200k` + `tiers` on some entries): v1 uses the base input/output rate; tier-boundary math only if a tiered model gets heavy use
   - Accumulated per session in sessions.db: **`cost_usd` (notional tokens x price) + `tokens_in`, `tokens_out`, `tokens_cached_read`, `tokens_cached_write`** (cleared together with the session by `/delete`)
   - Display decisions: `/cost` shows the **notional tokens x price** (Go's dollar limits are denominated that way even though the subscription bills $0); **`/context` and `/cost` both show the session totals: tokens in / out / cached read / cached write** (both providers report cached reads once the session header lands a cache hit; cached write stays 0 until an endpoint reports it)
-- [ ] Both commands are session-scoped (work in topics, rejected in the All topic - groups 20/22)
+- [ ] Both commands are session-scoped (work in topics, rejected in the All topic - **enforcement ships with P4**, group 20's delivery rules; the commands themselves are built and working in normal flow)
 
 ## P4 - Topic Flow & Session UX
 

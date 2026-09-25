@@ -94,6 +94,167 @@ class TestCache(unittest.TestCase):
             providers.fetch_models("nope", "k")
 
 
+class TestUsageCapture(unittest.TestCase):
+    def test_chat_fills_usage_out(self):
+        resp = {"choices": [{"message": {"content": "a"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                          "prompt_tokens_details": {"cached_tokens": 4}}}
+        with mock.patch.object(providers, "_request", return_value=resp):
+            out = {}
+            providers.chat("zen", "k", "m", [{"role": "user", "content": "hi"}],
+                           usage_out=out)
+        self.assertEqual(out["prompt_tokens"], 10)
+        self.assertEqual(out["prompt_tokens_details"]["cached_tokens"], 4)
+
+    def test_chat_without_usage_leaves_dict_empty(self):
+        resp = {"choices": [{"message": {"content": "a"}}]}
+        with mock.patch.object(providers, "_request", return_value=resp):
+            out = {}
+            providers.chat("zen", "k", "m", [{"role": "user", "content": "hi"}],
+                           usage_out=out)
+        self.assertEqual(out, {})
+
+    def _run_stream(self, chunks, out):
+        """Run chat_stream against fake SSE bytes; returns (payload, events)."""
+        captured = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                return iter(chunks)
+
+        def fake_urlopen(req, timeout=None):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeResp()
+
+        with mock.patch.object(providers.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            events = list(providers.chat_stream(
+                "zen", "k", "m", [{"role": "user", "content": "hi"}],
+                usage_out=out))
+        return captured.get("payload") or {}, events
+
+    def test_stream_requests_include_usage_and_captures_final_chunk(self):
+        chunks = [
+            b'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":2292,'
+            b'"completion_tokens":12}}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+        out = {}
+        payload, events = self._run_stream(chunks, out)
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+        self.assertEqual(events, [("content", "hi")])
+        self.assertEqual(out["prompt_tokens"], 2292)
+
+    def test_stream_captures_usage_attached_to_choice_chunk(self):
+        # Go attaches usage to a chunk that still carries choices
+        chunks = [
+            b'data: {"choices":[{"index":0,"finish_reason":"length","delta":{}}],'
+            b'"usage":{"prompt_tokens":14,"completion_tokens":12}}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+        out = {}
+        _payload, events = self._run_stream(chunks, out)
+        self.assertEqual(events, [])
+        self.assertEqual(out["completion_tokens"], 12)
+
+
+class TestMetadata(unittest.TestCase):
+    FIXTURE = {
+        "opencode": {"models": {
+            "glm-5.3-flash": {
+                "cost": {"input": 0.15, "output": 0.5, "cache_read": 0.03},
+                "limit": {"context": 1000000, "output": 131072},
+                "modalities": {"input": ["text", "image"]},
+            },
+        }},
+        "opencode-go": {"models": {
+            "mimo-v2.6-flash": {
+                "cost": {"input": 0.14, "output": 0.28, "cache_read": 0.0028},
+                "limit": {"context": 1048576},
+            },
+        }},
+        "openai": {"models": {"gpt-5.2": {"cost": {"input": 1.75}}}},  # ignored
+    }
+
+    def test_parse_metadata(self):
+        meta = providers.parse_metadata(self.FIXTURE)
+        self.assertEqual(set(meta), {"zen", "go"})
+        glm = meta["zen"]["glm-5.3-flash"]
+        self.assertEqual(glm["cost_in"], 0.15)
+        self.assertEqual(glm["cost_cache_read"], 0.03)
+        self.assertEqual(glm["context"], 1000000)
+        self.assertTrue(glm["image"])
+        mimo = meta["go"]["mimo-v2.6-flash"]
+        self.assertEqual(mimo["cost_out"], 0.28)
+        self.assertIsNone(mimo["cost_cache_write"])
+        self.assertFalse(mimo["image"])  # modalities absent -> no image input
+
+    def test_parse_metadata_garbage(self):
+        self.assertEqual(providers.parse_metadata("nope"), {})
+        self.assertEqual(providers.parse_metadata({}), {})
+
+    def test_fetch_then_cache_and_price_for(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(providers, "_get_json",
+                                   return_value=self.FIXTURE):
+                meta, from_cache = providers.models_metadata(d)
+            self.assertFalse(from_cache)
+            self.assertIn("glm-5.3-flash", meta["zen"])
+            self.assertTrue(os.path.isfile(os.path.join(d, "models_meta.json")))
+
+            providers._meta_memo.clear()  # forget the in-memory copy
+            with mock.patch.object(providers, "_get_json",
+                                   side_effect=providers.ProviderError("down")):
+                meta2, from_cache2 = providers.models_metadata(d)
+            self.assertTrue(from_cache2)
+            self.assertEqual(meta2, meta)
+
+            self.assertEqual(providers.price_for(d, "zen", "glm-5.3-flash")["cost_in"],
+                             0.15)
+            self.assertIsNone(providers.price_for(d, "zen", "nope"))
+
+    def test_total_failure_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(providers, "_get_json",
+                                   side_effect=providers.ProviderError("down")):
+                meta, _ = providers.models_metadata(d, force=True)
+            self.assertEqual(meta, {})
+
+
+class TestUsageCost(unittest.TestCase):
+    def test_cached_read_uses_cache_rate(self):
+        price = {"cost_in": 0.15, "cost_out": 0.5, "cost_cache_read": 0.03}
+        usage = {"prompt_tokens": 2292, "completion_tokens": 12,
+                 "prompt_tokens_details": {"cached_tokens": 2048}}
+        expected = (244 * 0.15 + 2048 * 0.03 + 12 * 0.5) / 1e6
+        self.assertAlmostEqual(providers.usage_cost(price, usage), expected)
+
+    def test_no_cache_rate_prices_cached_at_input(self):
+        price = {"cost_in": 0.14, "cost_out": 0.28}
+        usage = {"prompt_tokens": 100, "completion_tokens": 10,
+                 "prompt_tokens_details": {"cached_tokens": 60}}
+        self.assertAlmostEqual(providers.usage_cost(price, usage),
+                               (100 * 0.14 + 10 * 0.28) / 1e6)
+
+    def test_clamps_and_missing_data(self):
+        price = {"cost_in": 1.0, "cost_out": 2.0}
+        # cached larger than prompt (shouldn't happen) is clamped
+        usage = {"prompt_tokens": 10, "completion_tokens": 1,
+                 "prompt_tokens_details": {"cached_tokens": 99}}
+        self.assertAlmostEqual(providers.usage_cost(price, usage),
+                               (10 * 1.0 + 1 * 2.0) / 1e6)
+        self.assertEqual(providers.usage_cost(None, {"prompt_tokens": 5}), 0.0)
+        self.assertEqual(providers.usage_cost(price, None), 0.0)
+        self.assertEqual(providers.usage_cost(price, {}), 0.0)
+
+
 class TestMultipart(unittest.TestCase):
     def test_body_structure(self):
         import telegram as tg_mod

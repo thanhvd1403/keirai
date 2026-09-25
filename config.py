@@ -37,7 +37,7 @@ class Config:
         self.rich_messages = bool(data.get("rich_messages", True))
         self.stream_drafts = bool(data.get("stream_drafts", True))
         self.context_limit_chars = int(data.get("context_limit_chars", 120_000))
-        self.default_model = data.get("default_model", "zen/glm-5.3-flash")
+        self.default_model = data.get("default_model", "go/mimo-v2.6-flash")
         self.max_file_mb = int(data.get("max_file_mb", 20))
         self.tools_enabled = bool(data.get("tools_enabled", True))
         self.bash_timeout = int(data.get("bash_timeout", 30))
