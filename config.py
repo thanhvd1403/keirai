@@ -3,6 +3,7 @@
 Requires Python 3.11+ (tomllib is in the stdlib).
 """
 import os
+import re
 
 try:
     import tomllib
@@ -38,6 +39,7 @@ class Config:
         self.stream_drafts = bool(data.get("stream_drafts", True))
         self.context_limit_chars = int(data.get("context_limit_chars", 120_000))
         self.default_model = data.get("default_model", "go/mimo-v2.6-flash")
+        self.topic_flow = bool(data.get("topic_flow", False))
         self.max_file_mb = int(data.get("max_file_mb", 20))
         self.tools_enabled = bool(data.get("tools_enabled", True))
         self.bash_timeout = int(data.get("bash_timeout", 30))
@@ -90,6 +92,37 @@ def load(path=None):
             except tomllib.TOMLDecodeError as e:
                 raise ConfigError("%s is not valid TOML: %s" % (cand, e))
     return Config({}, path=None)
+
+
+def write_value(cfg, key, value):
+    """Surgically set a top-level `key = value` in the config file while
+    keeping every comment and section (used for `topic_flow` and
+    `/model global`). Returns the rendered literal, or None when there is no
+    config file (env-only setup -> caller falls back to in-memory)."""
+    if not cfg.path or not os.path.isfile(cfg.path):
+        return None
+    if isinstance(value, bool):
+        lit = "true" if value else "false"
+    elif isinstance(value, str):
+        lit = '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
+    else:
+        lit = str(value)
+    with open(cfg.path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    pattern = re.compile(r"^(\s*)%s\s*=.*$" % re.escape(key))
+    for i, line in enumerate(lines):
+        m = pattern.match(line)
+        if m:
+            lines[i] = "%s%s = %s" % (m.group(1), key, lit)
+            break
+    else:
+        # not present -> insert before the first section header (top level)
+        at = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")),
+                  len(lines))
+        lines.insert(at, "%s = %s" % (key, lit))
+    with open(cfg.path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return lit
 
 
 def base_dir(config):

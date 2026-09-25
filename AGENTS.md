@@ -28,7 +28,7 @@ keirai/
 ├── TODO.md              # Planned features
 ├── LICENSE              # AGPLv3
 ├── .gitignore           # Ignores config.toml (secrets), sessions.db, tools/, cache/, logs/, __pycache__
-├── main.py              # Entry point: polling loop, commands, routing, streaming, tool loop, /stop
+├── main.py              # Entry point: polling loop, commands, routing, streaming, tool loop, /stop, topic flow, /session, titles
 ├── config.py            # Config loading (TOML + env overrides)
 ├── telegram.py          # Telegram Bot API client (raw HTTP, multipart, rich messages, live edits)
 ├── md2tg.py             # Markdown -> Telegram HTML, message splitting
@@ -57,7 +57,7 @@ Run tests: `python -m unittest discover -s tests`
 
 ## Current Status
 
-P0 + P1 + P2 + P3 complete and tested (183 tests). The bot does:
+P0 + P1 + P2 + P3 + P4 complete and tested (213 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
@@ -78,10 +78,14 @@ P0 + P1 + P2 + P3 complete and tested (183 tests). The bot does:
 - **Go-first inference**: default model `go/mimo-v2.6-flash`; on a provider error the call retries once on the other provider when it has a key AND its catalog serves the model
 - **Usage accounting**: every call's `usage` (blocking + streaming via `stream_options.include_usage`) is accumulated per session in `sessions.db` (`session_meta`: session id `yyyymmdd-hhmm-4hex`, tokens in/out/cached read/cached write, notional cost with cached-read discount)
 - `/context` shows context usage (chars vs limit, auto-compact trigger, session name/id/model, token totals); `/cost` adds the session's notional total cost
+- **Topic flow** (switchable via `/topic`, flag persisted in `config.toml`): entering requires Threaded mode ON **and** "Disallow users to create topics" ON (both checked live via getMe, typed yes/no confirmation); while ON, All accepts commands only (session-scoped ones rejected with a hint, `/model global` allowed) and every message in a topic needs a bound session - unbound topics get a rejection hint
+- `/session [page N | N | <id>]`: lists sessions (name, id, timestamp, last-message preview - last-active first, current session excluded), switches them; in topic flow switching goes through typed per-slot prompts (switch-here / create-new / ping / do-nothing), with dead-topic ping recovery (`400 message thread not found` -> auto new topic)
+- Sessions move between **slots** (`thread_id` >0 = bound to that topic, main chat = None, negative = parked/unbound); `/new` creates a topic+bound session in topic flow, or parks the old session and starts blank in normal flow
+- **Agent titles**: after a session's first message one extra completion (default model) names it (media-only messages named from the media when vision-capable); `/rename` mirrors session+topic; `/model global <id>` writes the default to `config.toml` (comments preserved)
 - Photos -> vision models; media round-trip test via caption `media_test`
 - Logging: stderr + `logs/keirai.log` (rotating)
 
-Not implemented yet: P4 (topic flow & session UX: `/topic`, `/session`, delivery rules, titles) and P5 (custom OpenAI-compatible providers, interactive setup script) - see TODO.md.
+Not implemented yet: P5 (custom OpenAI-compatible providers, interactive setup script) - see TODO.md. Topic flow is unit-tested; the live walkthrough on the dev/production bot is still pending.
 
 ## External Components & Licenses
 

@@ -111,6 +111,45 @@ class Store:
     # ------------------------------------------------ session meta
     # session id + name + cost/token accumulators, stored separately from the
     # history row so save_session's INSERT OR REPLACE can never wipe them.
+    # A session's SLOT (thread_id) is its binding: >0 = bound to that topic,
+    # 0 = main chat, <0 = parked (unbound, recoverable via /session).
+
+    def create_session(self, chat_id, thread_id, name=None):
+        """Eagerly create an empty session at a slot (binds it there)."""
+        now = time.time()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sessions (chat_id, thread_id, model, messages, updated_at)"
+            " VALUES (?, ?, NULL, '[]', ?)", (chat_id, thread_id, now))
+        self.conn.execute(
+            "DELETE FROM session_meta WHERE chat_id=? AND thread_id=?",
+            (chat_id, thread_id))
+        self.conn.execute(
+            "INSERT INTO session_meta (chat_id, thread_id, session_id, name)"
+            " VALUES (?, ?, ?, ?)",
+            (chat_id, thread_id, new_session_id(), name))
+        self.conn.commit()
+
+    def move_session(self, chat_id, frm, to):
+        """Relocate a session (history + meta) from one slot to another.
+        The target slot must be free - the caller displaces any occupant."""
+        if self.conn.execute(
+                "SELECT 1 FROM sessions WHERE chat_id=? AND thread_id=?",
+                (chat_id, to)).fetchone():
+            raise ValueError("target slot %s/%s is occupied" % (chat_id, to))
+        self.conn.execute(
+            "UPDATE sessions SET thread_id=? WHERE chat_id=? AND thread_id=?",
+            (to, chat_id, frm))
+        self.conn.execute(
+            "UPDATE session_meta SET thread_id=? WHERE chat_id=? AND thread_id=?",
+            (to, chat_id, frm))
+        self.conn.commit()
+
+    def set_session_name(self, chat_id, thread_id, name):
+        self.ensure_meta(chat_id, thread_id)
+        self.conn.execute(
+            "UPDATE session_meta SET name=? WHERE chat_id=? AND thread_id=?",
+            (name, chat_id, thread_id))
+        self.conn.commit()
 
     def load_meta(self):
         """{(chat_id, thread_id): {session_id, name, cost_usd, tokens_*}}"""
@@ -175,6 +214,12 @@ class Store:
         """[(chat_id, thread_id, name)]"""
         return self.conn.execute(
             "SELECT chat_id, thread_id, name FROM topics").fetchall()
+
+    def remove_topic(self, chat_id, thread_id):
+        """Drop a dead topic from the registry (lazy cleanup after a failed ping)."""
+        self.conn.execute("DELETE FROM topics WHERE chat_id=? AND thread_id=?",
+                          (chat_id, thread_id))
+        self.conn.commit()
 
     def close(self):
         self.conn.close()

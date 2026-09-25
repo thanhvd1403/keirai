@@ -27,6 +27,7 @@ log = logging.getLogger("keirai")
 
 HISTORY_LIMIT = 24  # messages per chat kept in memory
 SESSION_ID = "keirai"  # anonymized x-opencode-session for the whole app (no chat ids)
+SLOT_NONE = object()  # sid_slot(): not found (None means the main-chat slot)
 TEXT_EXTS = {
     ".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml",
     ".ini", ".cfg", ".sh", ".bat", ".ps1", ".c", ".h", ".cpp", ".hpp", ".rs",
@@ -50,6 +51,10 @@ class State:
         self.history = {}    # (chat_id, thread) -> [messages]
         self.meta = {}       # (chat_id, thread) -> {session_id, name, cost, tokens}
         self.topic_names = {}  # (chat_id, thread_id) -> topic name
+        self.prompts = {}    # (chat_id, slot) -> pending typed-choice prompt
+        self.page = {}       # (chat_id, slot) -> current /session page
+        self.updated = {}    # (chat_id, slot) -> last-active timestamp
+        self.allows_user_topics = False  # getMe: "Disallow users to create topics"
         self._turn_lock = threading.Lock()
         self.active_turns = {}   # chat_key -> True while a reply/tool turn runs
         self.interrupts = set()  # chat_keys the user asked to /stop
@@ -80,9 +85,10 @@ class State:
             return key in self.interrupts
 
     def _load(self):
-        for chat_id, thread_id, model, messages, _updated in self.store.load_sessions():
+        for chat_id, thread_id, model, messages, updated in self.store.load_sessions():
             key = (chat_id, None if thread_id == 0 else thread_id)
             self.history[key] = messages
+            self.updated[key] = updated
             if model:
                 self.model[key] = model
         for (chat_id, thread_id), m in self.store.load_meta().items():
@@ -105,8 +111,11 @@ class State:
         key = self.chat_key(chat_id, thread_id)
         self.store.save_session(chat_id, thread_id or 0, self.model.get(key),
                                 self.history.get(key) or [])
+        self.updated[key] = time.time()
         if not (self.history.get(key) or []):
             # history wiped -> the session (and its accumulators) is gone
+            self.history.pop(key, None)
+            self.updated.pop(key, None)
             self.meta.pop(key, None)
 
     def thinking_on(self, user_id):
@@ -147,6 +156,78 @@ class State:
         if self.store:
             self.store.record_usage(chat_id, thread_id or 0, cost, tokens)
 
+    # ------------------------------------------------ session slots (P4)
+    # A session's slot (thread id) IS its binding: >0 = bound to that topic,
+    # None = main chat, <0 = parked (unbound, recoverable via /session).
+
+    def session_at(self, chat_id, thread_id):
+        """Is a session bound at this slot? (an empty history still counts)"""
+        return self.chat_key(chat_id, thread_id) in self.history
+
+    def sid_slot(self, chat_id, sid):
+        """Which slot holds session id `sid`? SLOT_NONE when unknown
+        (None is a real slot - the main chat)."""
+        for key, m in self.meta.items():
+            if key[0] == chat_id and m.get("session_id") == sid:
+                return key[1]
+        return SLOT_NONE
+
+    def session_name(self, chat_id, thread_id):
+        key = self.chat_key(chat_id, thread_id)
+        m = self.meta.get(key) or {}
+        return m.get("name") or self.topic_names.get(key) or ""
+
+    def free_slot(self, chat_id):
+        used = {k[1] for k in self.history if k[0] == chat_id}
+        used |= {k[1] for k in self.meta if k[0] == chat_id}
+        slot = -1
+        while slot in used:
+            slot -= 1
+        return slot
+
+    def move_session(self, chat_id, frm, to):
+        """Relocate session data between slots (state + store). Target free."""
+        src = self.chat_key(chat_id, frm)
+        dst = self.chat_key(chat_id, to)
+        if src == dst:
+            return
+        if dst in self.history or dst in self.meta:
+            raise ValueError("target slot occupied: %r" % (dst,))
+        for attr in ("history", "model", "meta", "updated"):
+            d = getattr(self, attr)
+            if src in d:
+                d[dst] = d.pop(src)
+        if self.store:
+            self.store.move_session(chat_id, frm or 0, to or 0)
+
+    def displace(self, chat_id, thread_id):
+        """Park whatever session occupies the slot (kept, recoverable)."""
+        key = self.chat_key(chat_id, thread_id)
+        if key not in self.history and key not in self.meta:
+            return False
+        self.move_session(chat_id, thread_id, self.free_slot(chat_id))
+        return True
+
+    def create_session(self, chat_id, thread_id, name=None):
+        """Fresh empty session bound at the slot."""
+        key = self.chat_key(chat_id, thread_id)
+        self.history[key] = []
+        self.meta[key] = {"session_id": sessions.new_session_id(),
+                          "name": name, "cost_usd": 0.0, "tokens_in": 0,
+                          "tokens_out": 0, "tokens_cached_read": 0,
+                          "tokens_cached_write": 0}
+        self.updated[key] = time.time()
+        if self.store:
+            self.store.create_session(chat_id, thread_id or 0, name)
+
+    def remove_topic_ref(self, chat_id, tid):
+        """Drop a dead topic from the registry (after a failed ping)."""
+        if tid in self.topics.get(chat_id, []):
+            self.topics[chat_id].remove(tid)
+        self.topic_names.pop((chat_id, tid), None)
+        if self.store:
+            self.store.remove_topic(chat_id, tid)
+
     def get_history(self, chat_id, thread_id):
         return self.history.setdefault(self.chat_key(chat_id, thread_id), [])
 
@@ -178,9 +259,10 @@ def build_help():
             lines.append("/%s - %s" % (name, desc))
     lines += [
         "",
-        "Each topic = one session with its own context. Enable Topics by turning "
-        "on Threaded mode for the bot in the @BotFather Mini App "
-        "(t.me/BotFather?startapp).",
+        "Sessions live in the plain main chat by default. Run /topic to enter "
+        "<b>topic flow</b>, where each topic = one session (Threaded mode must "
+        "be on, with \"Disallow users to create topics\" enabled); /session "
+        "lists and switches sessions.",
         "",
         "Send a photo to talk about it. Send media with caption <code>media_test</code> "
         "to test the media round-trip.",
@@ -289,10 +371,26 @@ def cmd_models(cfg, tg, msg, thread_id, state):
         tg.send(msg["chat"]["id"], part, thread_id)
 
 
-@command("model", "switch model: /model provider/model-id, e.g. /model go/glm-5.3-flash")
+@command("model", "switch model: /model provider/model-id, or /model global <provider/model-id>")
 def cmd_model(cfg, tg, msg, thread_id, state):
     arg = _arg(msg).strip()
     chat_id = msg["chat"]["id"]
+    if arg.lower().startswith("global"):  # chat-wide default (group 22)
+        val = arg[6:].strip()
+        if "/" not in val or val.split("/", 1)[0] not in providers.PROVIDER_BASES:
+            tg.send(chat_id, "usage: /model global &lt;provider/model&gt; "
+                             "(e.g. /model global go/glm-5.3-flash)", thread_id)
+            return
+        lit = config_mod.write_value(cfg, "default_model", val)
+        cfg.default_model = val
+        if lit is None:
+            tg.send(chat_id, "default model set to <code>%s</code> (memory only "
+                             "- no config file to persist to)" % _esc(val),
+                    thread_id)
+        else:
+            tg.send(chat_id, "default model set to <code>%s</code> (written to "
+                             "config.toml)" % _esc(val), thread_id)
+        return
     if not arg:
         current = state.model_for(chat_id, thread_id, cfg.default_model)
         tg.send(chat_id, "current model: <code>%s</code>\nusage: /model &lt;provider/model&gt;" % _esc(current), thread_id)
@@ -305,34 +403,357 @@ def cmd_model(cfg, tg, msg, thread_id, state):
     tg.send(chat_id, "model set to <code>%s</code>" % _esc(arg), thread_id)
 
 
-@command("new", "start a new session (new topic when topics are on): /new [name]")
+@command("new", "start a new session (new topic in topic flow): /new [name]")
 def cmd_new(cfg, tg, msg, thread_id, state):
-    """Start a new session: a fresh topic when topics are available,
-    otherwise reset the current (implicit) session."""
+    """Topic flow: new topic + eagerly-bound session (agent title lands after
+    the first message). Normal flow: the old session is parked (kept and
+    recoverable via /session), a blank one takes its place."""
     chat_id = msg["chat"]["id"]
-    name = _arg(msg).strip() or "Session %d" % state.next_session_num(chat_id)
-    if not state.topics_enabled:
-        key = state.chat_key(chat_id, thread_id)
-        state.history.pop(key, None)
-        state.model.pop(key, None)
-        state.meta.pop(key, None)  # fresh session -> fresh session id
-        tg.send(chat_id, "topics are not enabled for this bot - "
-                         "session cleared here instead. Turn on Threaded mode "
-                         "for the bot in the @BotFather Mini App to get one "
-                         "topic per session.", thread_id)
+    name = _arg(msg).strip()
+    if cfg.topic_flow:
+        placeholder = name or "New session"
+        try:
+            topic = tg.create_topic(chat_id, placeholder)
+        except Exception as e:
+            _err(tg, msg, thread_id, "could not create topic: %s" % e)
+            return
+        tid = topic["message_thread_id"]
+        if tid not in state.topics.setdefault(chat_id, []):
+            state.topics[chat_id].append(tid)
+        state.topic_names[(chat_id, tid)] = placeholder
+        if state.store:
+            state.store.add_topic(chat_id, tid, placeholder)
+        state.create_session(chat_id, tid, name=name or None)
+        log.info("session created: chat=%s topic=%s name=%r", chat_id, tid, name)
+        tg.send(chat_id, "new session started in a topic - type here", tid)
         return
+    if state.session_at(chat_id, thread_id):
+        state.displace(chat_id, thread_id)
+    state.create_session(chat_id, thread_id, name=name or None)
+    tg.send(chat_id, "new session started - the previous one is kept; "
+                     "recover it with /session.", thread_id)
+
+
+@command("topic", "switch between normal chat and topic flow: /topic")
+def cmd_topic(cfg, tg, msg, thread_id, state):
+    """Typed yes/no confirmation; entry verifies both getMe flags (group 22)."""
+    chat_id = msg["chat"]["id"]
+    slot = thread_id
+    entering = not cfg.topic_flow
+    state.prompts[(chat_id, slot)] = {"type": "flow", "enter": entering}
+    if entering:
+        tg.send(chat_id,
+                "<b>enter topic flow?</b> - sessions will live in Telegram "
+                "topics (one topic = one session, started with /new). Your "
+                "current main-chat session stays untouched.\n\n"
+                "type <code>yes</code> or <code>no</code>", thread_id)
+    else:
+        tg.send(chat_id,
+                "<b>leave topic flow?</b> - back to the plain main chat. "
+                "Topics and bindings are kept as-is.\n\n"
+                "type <code>yes</code> or <code>no</code>", thread_id)
+
+
+def _set_flow(cfg, value):
+    """Write-through the topic_flow flag: in-memory + config.toml (survives
+    restarts; env-only setups fall back to memory with a warning)."""
+    cfg.topic_flow = bool(value)
+    lit = config_mod.write_value(cfg, "topic_flow", cfg.topic_flow)
+    if lit is None:
+        log.warning("no config file available - topic_flow persists in memory only")
+
+
+def _enter_topic_flow(cfg, tg, chat_id, slot, state):
+    """Both preconditions must hold (group 22): Threaded mode ON and the
+    'Disallow users to create topics' toggle ENABLED."""
+    try:
+        me = tg.get_me()
+    except Exception as e:
+        tg.send(chat_id, "could not verify the topic settings: %s" % _esc(str(e)),
+                slot)
+        return
+    if not me.get("has_topics_enabled"):
+        tg.send(chat_id, "Threaded mode is off - enable it for this bot in the "
+                         "@BotFather Mini App (t.me/BotFather?startapp), then "
+                         "run /topic again.", slot)
+        return
+    if me.get("allows_users_to_create_topics"):
+        tg.send(chat_id, "please enable <b>Disallow users to create topics</b> "
+                         "first - otherwise the app silently creates a topic "
+                         "per message. Then run /topic again.", slot)
+        return
+    state.allows_user_topics = False
+    _set_flow(cfg, True)
+    log.info("topic flow ON: chat=%s", chat_id)
+    tg.send(chat_id, "topic flow is <b>on</b> - run /new to create your first "
+                     "topic. The All messages view only accepts commands.", slot)
+
+
+def _leave_topic_flow(cfg, tg, chat_id, slot, state):
+    _set_flow(cfg, False)
+    log.info("topic flow OFF: chat=%s", chat_id)
+    tg.send(chat_id, "topic flow is <b>off</b> - back to the plain main chat. "
+                     "Topics and bindings stay as they are.", slot)
+
+
+# ---------------------------------------------------------------- /session
+
+SESSIONS_PER_PAGE = 5
+_EXCLUDE_NOTHING = object()  # All view (topic flow): no session is active
+
+
+def _session_preview(history):
+    """Last user message, truncated; `[image]` when it carries no text."""
+    for m in reversed(history):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            c = " ".join(p.get("text", "") for p in c
+                         if isinstance(p, dict) and p.get("type") == "text")
+        c = (c or "").strip()
+        if not c:
+            return "[image]"
+        return c[:60] + ("…" if len(c) > 60 else "")
+    return "(empty)"
+
+
+def _session_rows(state, cfg, chat_id, view_slot):
+    """[{sid, name, updated, preview}] for this chat, last-active first,
+    excluding the session active at the viewing slot (group 22)."""
+    if not cfg.topic_flow:
+        exclude = None          # normal flow: the main-chat session is active
+    elif view_slot is not None:
+        exclude = view_slot     # topic flow: the session bound here is active
+    else:
+        exclude = _EXCLUDE_NOTHING  # All: nothing active, full list
+    rows = []
+    for key, m in state.meta.items():
+        if key[0] != chat_id or key[1] == exclude:
+            continue
+        if key not in state.history:  # meta without a session -> skip
+            continue
+        name = m.get("name") or state.topic_names.get(key) or ""
+        rows.append({
+            "sid": m.get("session_id") or "?",
+            "name": name or "(unnamed)",
+            "updated": state.updated.get(key) or 0.0,
+            "preview": _session_preview(state.history.get(key) or []),
+        })
+    rows.sort(key=lambda r: r["updated"], reverse=True)
+    return rows
+
+
+def _send_session_list(tg, chat_id, slot, rows, page, pkey, state):
+    if not rows:
+        tg.send(chat_id, "no other sessions yet - /new starts one", slot)
+        return
+    pages = (len(rows) + SESSIONS_PER_PAGE - 1) // SESSIONS_PER_PAGE
+    page = max(1, min(page, pages))
+    state.page[pkey] = page
+    chunk = rows[(page - 1) * SESSIONS_PER_PAGE:page * SESSIONS_PER_PAGE]
+    lines = ["<b>sessions</b> (page %d/%d, most recent first):" % (page, pages)]
+    for i, r in enumerate(chunk, 1):
+        ts = (time.strftime("%Y-%m-%d %H:%M", time.localtime(r["updated"]))
+              if r["updated"] else "-")
+        lines.append("%d. <b>%s</b> · <code>%s</code>\n   %s · %s"
+                     % (i, _esc(r["name"]), _esc(r["sid"]), ts,
+                        _esc(r["preview"])))
+    lines.append("switch: /session &lt;N&gt; (this page) or /session &lt;id&gt;"
+                 " · next page: /session page %d" % (page + 1 if page < pages else page))
+    tg.send(chat_id, "\n".join(lines), slot)
+
+
+@command("session", "list/switch sessions: /session [page N | N | <id>]")
+def cmd_session(cfg, tg, msg, thread_id, state):
+    chat_id = msg["chat"]["id"]
+    slot = thread_id
+    pkey = (chat_id, slot)
+    arg = _arg(msg).strip()
+    rows = _session_rows(state, cfg, chat_id, slot)
+
+    if not arg:
+        _send_session_list(tg, chat_id, slot, rows, 1, pkey, state)
+        return
+    if arg.lower().startswith("page "):
+        n = arg[5:].strip()
+        if not n.isdigit() or int(n) < 1:
+            tg.send(chat_id, "usage: /session page &lt;N&gt;", slot)
+            return
+        _send_session_list(tg, chat_id, slot, rows, int(n), pkey, state)
+        return
+    if arg.isdigit():  # Nth session on the CURRENT page
+        page = state.page.get(pkey, 1)
+        chunk = rows[(page - 1) * SESSIONS_PER_PAGE:page * SESSIONS_PER_PAGE]
+        idx = int(arg) - 1
+        if idx < 0 or idx >= len(chunk):
+            tg.send(chat_id, "no session #%s on this page - run /session to "
+                             "list" % _esc(arg), slot)
+            return
+        _begin_switch(cfg, tg, chat_id, slot, chunk[idx]["sid"], state)
+        return
+    # session id (contains dashes/hex - never a bare number)
+    if state.sid_slot(chat_id, arg) is SLOT_NONE:
+        tg.send(chat_id, "no session with id <code>%s</code>" % _esc(arg), slot)
+        return
+    _begin_switch(cfg, tg, chat_id, slot, arg, state)
+
+
+def _begin_switch(cfg, tg, chat_id, slot, sid, state):
+    """Resolve where the session lives and start the switch (immediately in
+    normal flow; via a typed prompt in topic flow - group 22 matrix)."""
+    src = state.sid_slot(chat_id, sid)
+    if src is SLOT_NONE:
+        tg.send(chat_id, "session not found", slot)
+        return
+    if src == slot:
+        tg.send(chat_id, "that session is already active here", slot)
+        return
+    name = state.session_name(chat_id, src) or "session"
+    if not cfg.topic_flow:  # normal flow: switch immediately
+        state.displace(chat_id, slot)
+        state.move_session(chat_id, src, slot)
+        tg.send(chat_id, "switched to <b>%s</b> · <code>%s</code>"
+                % (_esc(name), _esc(sid)), slot)
+        return
+    bound = src is not None and src > 0
+    if slot is None:  # invoked from All
+        if not bound:  # unbound -> immediately create its topic
+            _switch_new_topic(cfg, tg, chat_id, sid, state)
+            return
+        state.prompts[(chat_id, None)] = {"type": "switch", "actions": {
+            "1": {"act": "ping", "sid": sid},
+            "2": {"act": "nothing", "sid": sid}}}
+        tg.send(chat_id, "<b>%s</b> is bound to a topic. type:\n"
+                "1. ping the topic (locate it)\n2. do nothing" % _esc(name), None)
+        return
+    # invoked inside a topic
+    if not bound:
+        state.prompts[(chat_id, slot)] = {"type": "switch", "actions": {
+            "1": {"act": "switch_here", "sid": sid},
+            "2": {"act": "create_new", "sid": sid},
+            "3": {"act": "nothing", "sid": sid}}}
+        tg.send(chat_id, "<b>%s</b> has no topic. type:\n"
+                "1. switch here (bind it to this topic)\n"
+                "2. create a new topic for it\n3. do nothing" % _esc(name), slot)
+    else:
+        state.prompts[(chat_id, slot)] = {"type": "switch", "actions": {
+            "1": {"act": "switch_here", "sid": sid},
+            "2": {"act": "ping", "sid": sid},
+            "3": {"act": "nothing", "sid": sid}}}
+        tg.send(chat_id, "<b>%s</b> is bound to another topic. type:\n"
+                "1. switch here (moves it into this topic)\n"
+                "2. ping the topic (locate it)\n3. do nothing" % _esc(name), slot)
+
+
+def _switch_into(cfg, tg, chat_id, target_slot, sid, state, rename_topic=True):
+    """Move session `sid` into `target_slot`, parking any occupant."""
+    src = state.sid_slot(chat_id, sid)
+    if src is SLOT_NONE:
+        tg.send(chat_id, "session not found", target_slot)
+        return False
+    if src == target_slot:
+        return True
+    state.displace(chat_id, target_slot)
+    state.move_session(chat_id, src, target_slot)
+    if target_slot is not None and rename_topic:
+        # session and topic mirror each other (group 22)
+        name = state.session_name(chat_id, target_slot)
+        if name:
+            try:
+                tg.edit_topic(chat_id, target_slot, name)
+                state.topic_names[(chat_id, target_slot)] = name
+            except Exception as e:
+                log.warning("topic rename after switch failed: %s", e)
+    return True
+
+
+def _switch_new_topic(cfg, tg, chat_id, sid, state):
+    """Create a topic for the session and move it there (All-unbound switch
+    and the 'create new topic' prompt action)."""
+    src = state.sid_slot(chat_id, sid)
+    if src is SLOT_NONE:
+        tg.send(chat_id, "session not found", None)
+        return
+    name = state.session_name(chat_id, src) or "session"
     try:
         topic = tg.create_topic(chat_id, name)
     except Exception as e:
-        _err(tg, msg, thread_id, "could not create topic: %s" % e)
+        tg.send(chat_id, "could not create topic: %s" % _esc(str(e)),
+                src if src and src > 0 else None)
         return
     tid = topic["message_thread_id"]
-    state.topics.setdefault(chat_id, []).append(tid)
+    if tid not in state.topics.setdefault(chat_id, []):
+        state.topics[chat_id].append(tid)
     state.topic_names[(chat_id, tid)] = name
     if state.store:
         state.store.add_topic(chat_id, tid, name)
-    log.info("session created: chat=%s topic=%s name=%r", chat_id, tid, name)
-    tg.send(chat_id, "new session <b>%s</b> started - type here" % _esc(name), tid)
+    state.move_session(chat_id, src, tid)
+    log.info("session %s moved to new topic %s (chat=%s)", sid, tid, chat_id)
+    tg.send(chat_id, "session <b>%s</b> has its own topic now - continue there"
+            % _esc(name), tid)
+
+
+def _is_dead_thread(exc):
+    s = str(exc).lower()
+    return "thread" in s and "not found" in s
+
+
+def _ping_topic(cfg, tg, chat_id, sid, state, reply_slot):
+    """Locate the bound topic; on a dead topic (400 thread not found) unbind
+    it and create a fresh topic for the session (automatic recovery)."""
+    src = state.sid_slot(chat_id, sid)
+    if src is SLOT_NONE or src is None or src <= 0:
+        tg.send(chat_id, "that session has no topic to ping", reply_slot)
+        return
+    name = state.session_name(chat_id, src) or "session"
+    try:
+        tg.send(chat_id, "ping - <b>%s</b> lives here" % _esc(name), src)
+    except Exception as e:
+        if _is_dead_thread(e):
+            log.warning("ping failed, topic %s is dead - recovering: %s", src, e)
+            state.remove_topic_ref(chat_id, src)
+            _switch_new_topic(cfg, tg, chat_id, sid, state)
+            return
+        tg.send(chat_id, "ping failed: %s" % _esc(str(e)), reply_slot)
+        return
+    if reply_slot != src:
+        tg.send(chat_id, "topic found - the session stays bound there", reply_slot)
+
+
+def _prompt_reply(cfg, tg, chat_id, slot, prompt, text, state):
+    """Consume a typed reply to a pending prompt (the caller already popped
+    it). True = handled; False = not a choice -> 'do nothing' (the message
+    proceeds through the normal rules)."""
+    choice = (text or "").strip().lower()
+    if prompt.get("type") == "flow":
+        if choice in ("y", "yes"):
+            if prompt.get("enter"):
+                _enter_topic_flow(cfg, tg, chat_id, slot, state)
+            else:
+                _leave_topic_flow(cfg, tg, chat_id, slot, state)
+            return True
+        if choice in ("n", "no"):
+            tg.send(chat_id, "cancelled", slot)
+            return True
+        return False
+    if prompt.get("type") == "switch":
+        act = (prompt.get("actions") or {}).get(choice)
+        if not act:
+            return False
+        kind, sid = act.get("act"), act.get("sid")
+        if kind == "switch_here":
+            if _switch_into(cfg, tg, chat_id, slot, sid, state):
+                name = state.session_name(chat_id, slot) or "session"
+                tg.send(chat_id, "switched here: <b>%s</b> · <code>%s</code>"
+                        % (_esc(name), _esc(sid)), slot)
+        elif kind == "create_new":
+            _switch_new_topic(cfg, tg, chat_id, sid, state)
+        elif kind == "ping":
+            _ping_topic(cfg, tg, chat_id, sid, state, slot)
+        # "nothing": deliberately silent
+        return True
+    return False
 
 
 @command("reset-all", "wipe every session and delete the bot's topics", hidden=True)
@@ -385,25 +806,32 @@ def _confirmation_pair():
 
 @command("rename", "rename the current session/topic: /rename <name>")
 def cmd_rename(cfg, tg, msg, thread_id, state):
-    """Rename the current topic/session."""
+    """Renames session AND topic (they mirror each other, group 22); in the
+    main chat only the session name is set."""
     chat_id = msg["chat"]["id"]
     name = _arg(msg).strip()
     if not name:
         tg.send(chat_id, "usage: /rename &lt;name&gt;", thread_id)
         return
-    if thread_id is None:
-        tg.send(chat_id, "open (or create with /new) a topic first - there is "
-                         "nothing to rename in the main chat", thread_id)
+    if thread_id is None and not state.session_at(chat_id, thread_id):
+        tg.send(chat_id, "no active session yet - send a message or /new first",
+                thread_id)
         return
-    try:
-        tg.edit_topic(chat_id, thread_id, name)
-    except Exception as e:
-        _err(tg, msg, thread_id, "could not rename topic: %s" % e)
-        return
+    if thread_id is not None:
+        try:
+            tg.edit_topic(chat_id, thread_id, name)
+        except Exception as e:
+            _err(tg, msg, thread_id, "could not rename topic: %s" % e)
+            return
+        if state.store:
+            state.store.set_topic_name(chat_id, thread_id, name)
+        state.topic_names[(chat_id, thread_id)] = name
+    meta = state.ensure_meta(chat_id, thread_id)
+    meta["name"] = name
     if state.store:
-        state.store.set_topic_name(chat_id, thread_id, name)
-    state.topic_names[(chat_id, thread_id)] = name
-    tg.send(chat_id, "session renamed to <b>%s</b>" % _esc(name), thread_id)
+        state.store.set_session_name(chat_id, thread_id or 0, name)
+    where = "topic &amp; session" if thread_id is not None else "session"
+    tg.send(chat_id, "renamed (%s) to <b>%s</b>" % (where, _esc(name)), thread_id)
 
 
 @command("delete", "delete this session's context (topic stays; delete it manually)")
@@ -567,6 +995,75 @@ def _record_usage(cfg, state, chat_id, thread_id, usage, provider, model_id):
         "tokens_cached_read": max(0, min(cached, tin)),
         "tokens_cached_write": 0,  # never reported by the endpoints
     })
+
+
+def _maybe_name_session(cfg, tg, state, chat_id, thread_id, text, images):
+    """Group 19: one extra completion after a session's first message yields
+    a very short title (session name; topic renamed to match). Uses the
+    config default model (new sessions start there). Media-only first
+    messages are named from the media when the model is vision-capable,
+    else from a type descriptor. Runs after the reply: no first-answer
+    latency; failures keep the placeholder (one attempt per session)."""
+    meta = state.ensure_meta(chat_id, thread_id)
+    if meta.get("name") or meta.get("_named"):
+        return
+    meta["_named"] = True
+    excerpt = (text or "").strip()[:1500]
+    content = None
+    if images:
+        vision = False
+        try:
+            provider, _key, model_id = _resolve_provider(cfg, cfg.default_model)
+            stats = providers.price_for(config_mod.cache_dir(cfg),
+                                        provider, model_id)
+            vision = bool(stats and stats.get("image"))
+        except Exception:
+            vision = False
+        if vision:
+            content = [{"type": "text",
+                        "text": excerpt or "Name this conversation."}]
+            for mime, b64 in images:
+                content.append(providers.image_part(mime, b64))
+        else:
+            kind = images[0][0]
+            content = "the user sent a media file (%s)%s" % (
+                kind, " - " + excerpt if excerpt else "")
+    if content is None:
+        if not excerpt:
+            return
+        content = excerpt
+    provider, api_key, model_id = _resolve_provider(cfg, cfg.default_model)
+    if not api_key:
+        return
+    usage = {}
+    try:
+        out, _r, _t = providers.chat(
+            provider, api_key, model_id,
+            [{"role": "system",
+              "content": "Reply with ONLY a very short name for this new "
+                         "conversation: at most 4 words, no quotes, no "
+                         "punctuation, no markdown. It will be used as a "
+                         "session/topic title."},
+             {"role": "user", "content": content}],
+            session_id=SESSION_ID, usage_out=usage)
+    except Exception as e:
+        log.warning("session naming failed: %s", e)
+        return
+    _record_usage(cfg, state, chat_id, thread_id, usage, provider, model_id)
+    first = (out or "").strip().splitlines()[0] if (out or "").strip() else ""
+    title = first.strip().strip("\"'“”‘’*").strip()[:60]
+    if not title:
+        return
+    meta["name"] = title
+    if state.store:
+        state.store.set_session_name(chat_id, thread_id or 0, title)
+    if thread_id is not None:  # topic mirrors the session name
+        try:
+            tg.edit_topic(chat_id, thread_id, title)
+            state.topic_names[(chat_id, thread_id)] = title
+        except Exception as e:
+            log.warning("topic title rename failed: %s", e)
+    log.info("session titled: chat=%s thread=%s %r", chat_id, thread_id, title)
 
 
 def _est_chars(history):
@@ -843,15 +1340,19 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
 
     show = state.thinking_on(msg["from"]["id"])
     reasoning_md = reasoning if (show and reasoning and reasoning.strip()) else None
+    sent = False
     if cfg.rich_messages:
         try:
             _send_rich_answer(tg, chat_id, thread_id, answer, reasoning_md, live=live)
-            return
+            sent = True
         except tg_mod.TelegramError as e:
             log.warning("rich send failed, falling back to regular messages: %s", e)
-    parts = md2tg.send_parts(answer, reasoning_md)
-    for part in parts:
-        tg.send(chat_id, part, thread_id)
+    if not sent:
+        parts = md2tg.send_parts(answer, reasoning_md)
+        for part in parts:
+            tg.send(chat_id, part, thread_id)
+    # first answer delivered -> generate the session title (group 19)
+    _maybe_name_session(cfg, tg, state, chat_id, thread_id, text, images)
 
 
 def _deliver_interrupted(tg, state, msg, thread_id, partial, live):
@@ -1008,6 +1509,47 @@ def _media_echo(cfg, tg, msg, thread_id):
 
 
 # ---------------------------------------------------------------- routing
+# Delivery rules (groups 20/22): topic flow OFF = topics fully inert (hint
+# every message); topic flow ON = All takes commands only, topics need a
+# bound session; typed prompts live per slot (one per topic + one for All).
+
+SESSION_SCOPED = {"context", "cost", "compact", "delete", "rename", "model",
+                  "stop"}
+
+HINT_TOPIC_FLOW_OFF = (
+    "topic flow is off - messages inside topics are ignored. "
+    "Talk to me in All messages, or run /topic there to switch modes.")
+HINT_ALL_PLAIN = (
+    "topic flow is on - messages in All are ignored. "
+    "/new starts a topic, /session switches sessions.")
+HINT_ALL_NEEDS_SESSION = (
+    "that command needs a session - start one with /new or open a topic. "
+    "(<code>/model global &lt;provider/model&gt;</code> works anywhere.)")
+HINT_UNBOUND_TOPIC = (
+    "this topic is bound to no session - use /session to bind a session, "
+    "or /new to start a new one.")
+
+TOPIC_SERVICE_EVENTS = (
+    "forum_topic_edited", "forum_topic_deleted", "forum_topic_closed",
+    "forum_topic_reopened", "forum_topic_unrestricted")
+
+
+def _session_scoped(name, rest):
+    """/model global is chat-wide (allowed everywhere - group 22)."""
+    if name == "model" and rest.strip().lower().startswith("global"):
+        return False
+    return name in SESSION_SCOPED
+
+
+def _dispatch_command(cfg, tg, msg, text, thread_id, state):
+    cmd, _, rest = text[1:].partition(" ")
+    msg["_arg"] = rest
+    entry = COMMANDS.get(cmd.split("@", 1)[0])  # tolerate /cmd@botname
+    if entry is None:
+        tg.send(msg["chat"]["id"], "unknown command, try /help", thread_id)
+    else:
+        entry[0](cfg, tg, msg, thread_id, state)
+
 
 def handle_message(cfg, tg, msg, state):
     chat_id = msg["chat"]["id"]
@@ -1020,18 +1562,70 @@ def handle_message(cfg, tg, msg, state):
     log.info("message from user %s (@%s) chat=%s thread=%s",
              user.get("id"), user.get("username"), chat_id, thread_id)
 
-    text = msg.get("text") or msg.get("caption") or ""
-    if text.startswith("/"):
-        cmd, _, rest = text[1:].partition(" ")
-        msg["_arg"] = rest
-        entry = COMMANDS.get(cmd.split("@", 1)[0])  # tolerate /cmd@botname
-        if entry is None:
-            tg.send(chat_id, "unknown command, try /help", thread_id)
-        else:
-            entry[0](cfg, tg, msg, thread_id, state)
+    # topic lifecycle: witness creations into the registry, never hinted
+    if "forum_topic_created" in msg:
+        created = msg.get("forum_topic_created") or {}
+        if thread_id:
+            if thread_id not in state.topics.setdefault(chat_id, []):
+                state.topics[chat_id].append(thread_id)
+            state.topic_names[(chat_id, thread_id)] = created.get("name") or ""
+            if state.store:
+                state.store.add_topic(chat_id, thread_id, created.get("name"))
+        return
+    if any(k in msg for k in TOPIC_SERVICE_EVENTS):
         return
 
-    if msg.get("photo") or msg.get("document") or msg.get("video") or msg.get("voice") or msg.get("audio"):
+    text = msg.get("text") or msg.get("caption") or ""
+    is_cmd = text.startswith("/")
+    slot = thread_id
+    flow = cfg.topic_flow
+    in_topic = thread_id is not None
+
+    if is_cmd:
+        # any command cancels a pending prompt in its own slot, then runs
+        state.prompts.pop((chat_id, slot), None)
+    else:
+        prompt = state.prompts.get((chat_id, slot))
+        if prompt is not None:
+            state.prompts.pop((chat_id, slot), None)
+            if _prompt_reply(cfg, tg, chat_id, slot, prompt, text, state):
+                return
+            # not a choice -> "do nothing": the message proceeds normally
+
+    # --- mode gates -------------------------------------------------------
+    if in_topic and not flow:
+        # topics fully inert while flow is off: plain AND commands
+        tg.send(chat_id, HINT_TOPIC_FLOW_OFF, thread_id)
+        return
+    if not in_topic and flow:
+        if is_cmd:
+            name, _, rest = text[1:].partition(" ")
+            name = name.split("@", 1)[0]
+            if _session_scoped(name, rest):
+                tg.send(chat_id, HINT_ALL_NEEDS_SESSION, None)
+                return
+            _dispatch_command(cfg, tg, msg, text, thread_id, state)
+            return
+        tg.send(chat_id, HINT_ALL_PLAIN, None)  # hint every plain message/media
+        return
+
+    # --- normal path: main chat (flow off) or a topic (flow on) -----------
+    if is_cmd:
+        name, _, rest = text[1:].partition(" ")
+        name = name.split("@", 1)[0]
+        if in_topic and not state.session_at(chat_id, thread_id) \
+                and _session_scoped(name, rest):
+            tg.send(chat_id, HINT_UNBOUND_TOPIC, thread_id)
+            return
+        _dispatch_command(cfg, tg, msg, text, thread_id, state)
+        return
+
+    if in_topic and not state.session_at(chat_id, thread_id):
+        tg.send(chat_id, HINT_UNBOUND_TOPIC, thread_id)
+        return
+
+    if msg.get("photo") or msg.get("document") or msg.get("video") \
+            or msg.get("voice") or msg.get("audio"):
         handle_media(cfg, tg, msg, thread_id, state)
         return
 
@@ -1150,10 +1744,12 @@ def main():
     try:
         me = tg.get_me()
         state.topics_enabled = bool(me.get("has_topics_enabled"))
-        log.info("bot @%s ready (private-chat topics: %s)",
+        state.allows_user_topics = bool(me.get("allows_users_to_create_topics"))
+        log.info("bot @%s ready (private-chat topics: %s, disallow-user-topics: %s)",
                  me.get("username", "?"),
                  "on" if state.topics_enabled else
-                 "off - enable Threaded mode in the @BotFather Mini App")
+                 "off - enable Threaded mode in the @BotFather Mini App",
+                 "on" if state.allows_user_topics else "off")
     except tg_mod.TelegramError as e:
         log.error("getMe failed: %s (continuing without topic support)", e)
     try:

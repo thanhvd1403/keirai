@@ -21,6 +21,7 @@ bash_timeout = 30                        # default shell timeout in seconds (the
 # Lightpanda browser: run `bash deploy/install_lightpanda.sh` - the browse
 # tool only appears to the model after the binary is installed in ./tools/
 default_model = "go/mimo-v2.6-flash"      # provider/model-id (Go is tried first; Zen is the error fallback)
+topic_flow = false                       # sessions live in Telegram topics; run /topic to switch modes (then /new)
 max_file_mb = 20                         # download size cap
 system_prompt = """You are Keirai, a lightweight AI agent running on a small server. Answer using markdown."""
 

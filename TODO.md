@@ -199,40 +199,40 @@
     - Tiered models (`context_over_200k` + `tiers` on some entries): v1 uses the base input/output rate; tier-boundary math only if a tiered model gets heavy use
   - Accumulated per session in sessions.db: **`cost_usd` (notional tokens x price) + `tokens_in`, `tokens_out`, `tokens_cached_read`, `tokens_cached_write`** (cleared together with the session by `/delete`)
   - Display decisions: `/cost` shows the **notional tokens x price** (Go's dollar limits are denominated that way even though the subscription bills $0); **`/context` and `/cost` both show the session totals: tokens in / out / cached read / cached write** (both providers report cached reads once the session header lands a cache hit; cached write stays 0 until an endpoint reports it)
-- [ ] Both commands are session-scoped (work in topics, rejected in the All topic - **enforcement ships with P4**, group 20's delivery rules; the commands themselves are built and working in normal flow)
+- [x] Both commands are session-scoped (work in topics, rejected in the All topic - enforcement ships with P4's group 20 delivery rules ✓)
 
-## P4 - Topic Flow & Session UX
+## P4 - Topic Flow & Session UX (complete)
 
 > The switchable `/topic` mode with All-topic rules, `/session` switching,
 > per-session prompts and agent titles. Specs live in groups 19, 20, 22.
 
 **Implementation points (in order):**
-1. [ ] **`/session` command** (group 22): list (name/id/timestamp/preview, last-active first, `[image]` placeholder), `page N`, `N` against current page, `<id>` immediate switch; never lists the current session
-2. [ ] **Prompt machinery**: typed-choice prompts with **per-session slots** (one per topic + one for All), command-cancels-own-slot, wait forever, plain message = "do nothing" + normal handling (reuses `/reset-all` pending-confirm pattern)
-3. [ ] **Topic-flow mode** (group 22): `topic_flow` flag write-through in config.toml; `/topic` enter (typed confirm, BOTH `getMe` preconditions with hints, no auto-created topic, hint `/new`) & exit (typed confirm, persist flag)
-4. [ ] **Delivery rules** (group 20): All = commands only (+ hint every plain message), unbound-topic rejection hint, flow-off = topics fully inert + hint every message; rejected/allowed command lists in All
-5. [ ] **Bindings & switching** (group 22): topic<->session binding table, switching matrix (normal / unbound / bound x All / in-topic), per-topic prompts, ping liveness + dead-topic recovery, `/stop` topic-only
-6. [ ] **Titles** (group 19): extra naming completion after the first user message (default model, runs after the reply, media-aware via models.dev vision info); `/new` in All/topic creates topic + first-message title
-7. [ ] **Mirror commands**: `/rename` renames session AND topic; `/model global <id>` surgical config.toml write (keep comments)
-8. [ ] Rewrite the group-9 per-topic isolation tests around flow on/off; live dev-bot verification (entry preconditions, hints, ping recovery, drafts-in-topics already proven)
+1. [x] **`/session` command** (group 22): list (name/id/timestamp/preview, last-active first, `[image]` placeholder), `page N`, `N` against current page, `<id>` immediate switch; never lists the current session
+2. [x] **Prompt machinery**: typed-choice prompts with **per-session slots** (one per topic + one for All), command-cancels-own-slot, wait forever, plain message = "do nothing" + normal handling (reuses `/reset-all` pending-confirm pattern)
+3. [x] **Topic-flow mode** (group 22): `topic_flow` flag write-through in config.toml; `/topic` enter (typed confirm, BOTH `getMe` preconditions with hints, no auto-created topic, hint `/new`) & exit (typed confirm, persist flag)
+4. [x] **Delivery rules** (group 20): All = commands only (+ hint every plain message), unbound-topic rejection hint, flow-off = topics fully inert + hint every message; rejected/allowed command lists in All
+5. [x] **Bindings & switching** (group 22): topic<->session binding table, switching matrix (normal / unbound / bound x All / in-topic), per-topic prompts, ping liveness + dead-topic recovery, `/stop` topic-only
+6. [x] **Titles** (group 19): extra naming completion after the first user message (default model, runs after the reply, media-aware via models.dev vision info); `/new` in All/topic creates topic + first-message title
+7. [x] **Mirror commands**: `/rename` renames session AND topic; `/model global <id>` surgical config.toml write (keep comments)
+8. [x] Rewrite the group-9 per-topic isolation tests around flow on/off (213 tests green: mode gates, hints, prompt matrix, ping recovery, titles, config writes) - **unit-tested; live walkthrough with you still pending** (drafts-in-topics + getMe flags already proven live)
 
 ### 19. Agent-generated session titles
-- [ ] New sessions get an agent-generated **very short** title (replaces the current "Session N"; `/new <name>` skips generation)
+- [x] New sessions get an agent-generated **very short** title (replaces the current "Session N"; `/new <name>` skips generation)
   - **Mechanism: one extra completion** after the first user message in the session, using **the session's active model - a new session always starts on the default model from config.toml, so use that** (decision)
   - Applied in **both flows**: normal flow (real names in the `/session` list) and topic flow (the topic is renamed to match - mirrors `/rename`, group 22)
   - Runs **after** the main reply so first-answer latency is unaffected; on failure keep the placeholder
   - **Media-only first message**: still named **based on the media** - the naming call includes the media itself when the model is vision-capable, else a type/filename descriptor ("photo", "report.pdf")
 
 ### 20. Topic-only delivery & All-topic rules
-- [ ] All AI messages must be delivered inside a topic - **ignore every message sent to the "All" topic**
+- [x] All AI messages must be delivered inside a topic - **ignore every message sent to the "All" topic**
   - [x] Verified live (2026-09 dev bot): in topic flow, All-topic messages arrive with **NO `message_thread_id`** -> `thread_id is None` = All, `thread_id` set = topic session
   - ⚠️ When `allows_users_to_create_topics` (BotFather "allow user to create topics") is ON, sending from the All view makes the client **implicitly create a topic per message** (`is_name_implicit`, auto-named after the text - e.g. a topic literally named "/new"). This option must be OFF (see group 22)
-  - [ ] Plain message in All during topic flow: ignore + send a **hint EVERY time** ("topic flow is on - /new to start a topic, /session to switch")
-- [ ] Message lands in a topic that is **bound to no session** (residual/manual topic) during topic flow: **reject with a hint** - "this topic is bound to no session, use /session to bind a session"
-- [ ] The "All" topic only accepts suitable commands, e.g.:
+  - [x] Plain message in All during topic flow: ignore + send a **hint EVERY time** ("topic flow is on - /new to start a topic, /session to switch")
+- [x] Message lands in a topic that is **bound to no session** (residual/manual topic) during topic flow: **reject with a hint** - "this topic is bound to no session, use /session to bind a session"
+- [x] The "All" topic only accepts suitable commands, e.g.:
   - `/new` **in All** creates a new topic, then the topic title is set (very short, agent-generated, group 19) after the first user message sent in it
   - `/new` **inside an individual topic** causes the same behaviour (creates a new topic + first-message title), and the `/new` itself is **ignored in the history of the current session** (commands are never recorded)
-- [ ] Session-scoped commands are unavailable in the All topic: `/context`, `/cost`, `/stop`, `/compact`, `/delete`, `/rename`, `/model` - reject with a short hint to use `/new` or open a topic
+- [x] Session-scoped commands are unavailable in the All topic: `/context`, `/cost`, `/stop`, `/compact`, `/delete`, `/rename`, `/model` - reject with a short hint to use `/new` or open a topic
   - Includes the new `/context` and `/cost` commands (see group 21)
 
 ### 22. Topic flow - switchable mode (via /topic)
@@ -241,64 +241,64 @@
 > Group 22 spec COMPLETE (2026-09-25) - no open questions remain.
 
 **Normal flow (default):**
-- [ ] Message like normal (no thread id)
-- [ ] `/new` clears the current context and moves to a blank session
+- [x] Message like normal (no thread id)
+- [x] `/new` clears the current context and moves to a blank session
   - Old sessions are still saved in the DB so the user can recover them with `/session` (list + switch - same command as in topic flow)
 
 **Entering topic flow - `/topic` command:**
-- [ ] First ask the user to confirm the switch (typed reply) - explained: sessions are started afterwards with `/new`
+- [x] First ask the user to confirm the switch (typed reply) - explained: sessions are started afterwards with `/new`
   - The **active main-chat session is left intact, NOT cleared/deleted** - the main chat becomes the "All messages" view; the user can recover that session later via `/session` from All or from a topic
-- [ ] Preconditions - **BOTH must hold**, else refuse with a hint:
+- [x] Preconditions - **BOTH must hold**, else refuse with a hint:
   - Threaded mode ON (`has_topics_enabled` via getMe) - hint: enable Threaded mode in the @BotFather Mini App
   - **"Disallow users to create topics" toggle ENABLED** (`allows_users_to_create_topics == false` via getMe) - hint: enable that toggle (otherwise the client implicitly creates topics per message - group 20)
   - Topic flow only works when both Threaded mode and "Disallow users to create topics" are enabled (decision)
-- [ ] Persist the mode flag **in config.toml** (write-through: update file + in-memory) so it survives restarts (decision)
-- [ ] **No topic auto-created at entry** (decision) - just hint the user to run `/new` to create the first topic
-- [ ] **No residual-topic check at entry** (decision) - liveness is only verified when a ping is called (see switching logic)
+- [x] Persist the mode flag **in config.toml** (write-through: update file + in-memory) so it survives restarts (decision)
+- [x] **No topic auto-created at entry** (decision) - just hint the user to run `/new` to create the first topic
+- [x] **No residual-topic check at entry** (decision) - liveness is only verified when a ping is called (see switching logic)
   - Constraints (verified live): the Bot API has **no "list topics" method**, and **topic deletions are NOT broadcast** to the bot (no `forum_topic_deleted` event); sending into a dead topic fails with `400 message thread not found` - the ping is the liveness probe
   - The `topics` table in sessions.db remains the registry of bot-created topics (persists across restarts); `forum_topic_created` events are registered as they stream past
-- [ ] Each topic binds to a session in the database (sessions.db)
+- [x] Each topic binds to a session in the database (sessions.db)
 
 **The `/session` command (all flows):**
-- [ ] `/session` (no args): list the **first 5 sessions** - each row shows **name, session id**, **timestamp** + **preview of the last user message**; **ordered by last-active (most recent first)**; if the last user message has no text, the preview is the placeholder **`[image]`**
-- [ ] `/session page N` - show the Nth page (5 sessions per page)
-- [ ] `/session N` - switch to the Nth session **on the current page** (remember the current page per chat so N resolves against it)
-- [ ] `/session <id>` - switch immediately to that specific session
+- [x] `/session` (no args): list the **first 5 sessions** - each row shows **name, session id**, **timestamp** + **preview of the last user message**; **ordered by last-active (most recent first)**; if the last user message has no text, the preview is the placeholder **`[image]`**
+- [x] `/session page N` - show the Nth page (5 sessions per page)
+- [x] `/session N` - switch to the Nth session **on the current page** (remember the current page per chat so N resolves against it)
+- [x] `/session <id>` - switch immediately to that specific session
   - **Session id format: `yyyymmdd-hhmm-4hex`**, assigned when the session is created (unambiguous vs the bare-number page selector); stored in sessions.db
-- [ ] The list **never includes the current active session**: not the session bound to the topic you're in, and not the main-chat session when running in normal flow; when `/session` is run in **All** (topic flow) no session is active there, so the full list is allowed
+- [x] The list **never includes the current active session**: not the session bound to the topic you're in, and not the main-chat session when running in normal flow; when `/session` is run in **All** (topic flow) no session is active there, so the full list is allowed
 
 **Prompt mechanics (every typed-choice prompt in this flow):**
-- [ ] Choices are made via **typed replies** (reuses the `/reset-all` pending-confirm machinery - no inline keyboards / callback_query)
-- [ ] Running **any command** while a prompt is pending **cancels** that session's prompt (the command runs normally; prompts in other sessions are untouched)
-- [ ] Prompt slots are **per session**: one per topic **plus one for the All view** - multiple prompts can be outstanding at the same time across different topics
-- [ ] A prompt **waits forever** (no timeout); a new prompt in the same session replaces that session's pending one
-- [ ] Sending a plain new message while a prompt is pending in the same session = the "do nothing" choice + the message is handled normally (per switching logic / delivery rules)
+- [x] Choices are made via **typed replies** (reuses the `/reset-all` pending-confirm machinery - no inline keyboards / callback_query)
+- [x] Running **any command** while a prompt is pending **cancels** that session's prompt (the command runs normally; prompts in other sessions are untouched)
+- [x] Prompt slots are **per session**: one per topic **plus one for the All view** - multiple prompts can be outstanding at the same time across different topics
+- [x] A prompt **waits forever** (no timeout); a new prompt in the same session replaces that session's pending one
+- [x] Sending a plain new message while a prompt is pending in the same session = the "do nothing" choice + the message is handled normally (per switching logic / delivery rules)
 
 **Switching logic:**
-- [ ] **Normal flow**: switch immediately to the selected session
-- [ ] **Topic flow, session has no bound topic:**
+- [x] **Normal flow**: switch immediately to the selected session
+- [x] **Topic flow, session has no bound topic:**
   - `/session` triggered **in All**: immediately create a topic, rename it to the session name, continue from there
   - `/session` triggered **inside a topic**: ask the user **3 options** - **1. switch here** (bind session to this topic) / **2. create new topic** (as above) / **3. do nothing**
     - **Any new message in this same topic while the prompt is open counts as "do nothing"**: the prompt is cancelled and the agent answers the new message normally
-- [ ] **Topic flow, session has a bound topic**:
+- [x] **Topic flow, session has a bound topic**:
   - `/session` triggered **in All**: ask the user **2 options** - **1. ping** the bound topic (locate it) / **2. do nothing**
   - `/session` triggered **inside a topic**: ask the user **3 options** - **1. switch here** (rebind the session to this topic) / **2. ping** / **3. do nothing** (new message = do nothing, as above)
   - **If ping fails** (`400 message thread not found` - topic was deleted): in both cases immediately **unbind the dead topic id and create a new topic for that session** (automatic recovery; ping doubles as the liveness probe)
   - **"switch here" unbinds the session's previous topic** (old topic stays, just unbound)
-- [ ] **Leaving topic flow (`/topic` off)**: keep all binding ids - topics are NOT deleted when leaving topic flow
-- [ ] `/unbound`: **dropped by decision** - unbinding now happens implicitly (switching elsewhere / dead-topic recovery)
-- [ ] `/rename` inside topic flow renames **both the session and the topic** (they mirror each other)
-- [ ] `/model` is **session-scoped** (sets the model of the current session); **`/model global <provider/model-id>`** (e.g. `/model global go/glm-5.3-flash`) sets the **default model in config.toml** (persisted by writing the file at runtime; implementation note: surgical line edit to keep config comments)
-- [ ] Delivery rules of group 20 apply (AI answers only inside topics; All accepts suitable commands only, incl. `/new` and `/session`)
+- [x] **Leaving topic flow (`/topic` off)**: keep all binding ids - topics are NOT deleted when leaving topic flow
+- [x] `/unbound`: **dropped by decision** - unbinding now happens implicitly (switching elsewhere / dead-topic recovery)
+- [x] `/rename` inside topic flow renames **both the session and the topic** (they mirror each other)
+- [x] `/model` is **session-scoped** (sets the model of the current session); **`/model global <provider/model-id>`** (e.g. `/model global go/glm-5.3-flash`) sets the **default model in config.toml** (persisted by writing the file at runtime; implementation note: surgical line edit to keep config comments)
+- [x] Delivery rules of group 20 apply (AI answers only inside topics; All accepts suitable commands only, incl. `/new` and `/session`)
 
 **Command availability in All (decision):**
-- [ ] **Rejected in All** (session-scoped): `/context`, `/cost`, `/compact`, `/delete`, `/rename`, `/model` (except `/model global`), **`/stop`** - `/stop must be run inside a topic** (no global interrupt)
-- [ ] **Allowed in All**: `/new`, `/session`, `/topic`, `/help`, `/start`, `/models`, `/thinking`, `/test_md`, `/test_rich`, `/reset-all` (chat-wide)
+- [x] **Rejected in All** (session-scoped): `/context`, `/cost`, `/compact`, `/delete`, `/rename`, `/model` (except `/model global`), **`/stop`** - `/stop must be run inside a topic** (no global interrupt)
+- [x] **Allowed in All**: `/new`, `/session`, `/topic`, `/help`, `/start`, `/models`, `/thinking`, `/test_md`, `/test_rich`, `/reset-all` (chat-wide)
 
 **Leaving topic flow - running `/topic` again:**
-- [ ] User must confirm switching back to the normal flow (typed reply, same mechanics)
-- [ ] Persist the mode flag back to config.toml (as at entry)
-- [ ] After the switch: all bot messages are sent **without** a thread ID; **EVERY message that lands inside a topic is ignored - plain messages AND commands alike - and answered with a hint EVERY time** (topics are fully inert while flow is off; session recovery then works via `/session` from All only - `/session` from a topic applies while topic flow is ON)
+- [x] User must confirm switching back to the normal flow (typed reply, same mechanics)
+- [x] Persist the mode flag back to config.toml (as at entry)
+- [x] After the switch: all bot messages are sent **without** a thread ID; **EVERY message that lands inside a topic is ignored - plain messages AND commands alike - and answered with a hint EVERY time** (topics are fully inert while flow is off; session recovery then works via `/session` from All only - `/session` from a topic applies while topic flow is ON)
 
 ## P5 - Custom OpenAI-Compatible Providers (last)
 

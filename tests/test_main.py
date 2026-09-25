@@ -22,8 +22,16 @@ class FakeTG:
         self.renamed = []    # (chat_id, thread_id, name)
         self.deleted_topics = []  # (chat_id, thread_id)
         self._next_tid = 500
+        self.me = {"has_topics_enabled": True,
+                   "allows_users_to_create_topics": False}
+        self.fail_threads = set()  # thread ids whose send raises (dead topic)
+
+    def get_me(self):
+        return dict(self.me)
 
     def send(self, chat_id, text, thread_id=None):
+        if thread_id in self.fail_threads:
+            raise Exception("Bad Request: message thread not found")
         self.sent.append((chat_id, text, thread_id))
         return {"message_id": len(self.sent)}
 
@@ -89,11 +97,20 @@ def msg(text=None, user_id=42, **extra):
     return m
 
 
+def disable_titles(test):
+    """Group-19 naming issues one extra chat call per new session; neutralize
+    it so tests see exactly one call per turn (and never hit the network)."""
+    p = mock.patch.object(main, "_maybe_name_session", lambda *a, **k: None)
+    p.start()
+    test.addCleanup(p.stop)
+
+
 class TestRouter(unittest.TestCase):
     def setUp(self):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config()
+        disable_titles(self)
 
     def test_denied_user_ignored(self):
         main.handle_message(self.cfg, self.tg, msg(user_id=999, text="hi"), self.state)
@@ -209,99 +226,154 @@ class TestRouter(unittest.TestCase):
 
 
 class TestSessions(unittest.TestCase):
+    """P4: sessions live in topics while topic flow is ON (groups 19/20/22)."""
+
     def setUp(self):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config()
+        self.cfg.topic_flow = True
+        disable_titles(self)
 
     @mock.patch.object(providers, "chat", return_value=("a1", "", None))
     def test_new_creates_topic_and_context_isolated(self, chat_mock):
-        self.state.topics_enabled = True
         main.handle_message(self.cfg, self.tg, msg(text="/new work stuff"), self.state)
-        # a topic was created and a welcome message sent INTO it
+        # topic created, welcome sent INTO it, session bound eagerly
         tid = self.tg.topics["work stuff"]
-        self.assertEqual(self.tg.sent[-1], (100, "new session <b>work stuff</b> started - type here", tid))
-
-        # chat inside the new topic -> own history, isolated from main chat
-        main.handle_message(self.cfg, self.tg, msg(text="hello", message_thread_id=tid), self.state)
+        self.assertEqual(self.tg.sent[-1],
+                         (100, "new session started in a topic - type here", tid))
+        self.assertTrue(self.state.session_at(100, tid))
+        # inside the topic -> own history, isolated from All
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="hello", message_thread_id=tid), self.state)
+        self.assertEqual([m["content"] for m in self.state.get_history(100, tid)],
+                         ["hello", "a1"])
+        # plain message in All -> hint, no answer, no history (group 20)
         main.handle_message(self.cfg, self.tg, msg(text="main chat"), self.state)
-        self.assertEqual([m["content"] for m in self.state.get_history(100, tid)], ["hello", "a1"])
-        self.assertEqual([m["content"] for m in self.state.get_history(100, None)], ["main chat", "a1"])
+        self.assertEqual(self.state.history.get((100, None)), None)
+        self.assertIn("topic flow is on", self.tg.sent[-1][1])
 
     @mock.patch.object(providers, "chat", return_value=("a1", "", None))
-    def test_two_topics_and_main_fully_isolated(self, chat_mock):
-        """Two topics + main chat: histories, provider payloads and provider
-        session ids are completely disjoint - no cross-contamination."""
-        for tid, text in ((11, "about apples"), (22, "about bolts"),
-                          (None, "main chat text")):
+    def test_two_topics_isolated_all_hinted(self, chat_mock):
+        main.handle_message(self.cfg, self.tg, msg(text="/new apples"), self.state)
+        t1 = self.tg.topics["apples"]
+        main.handle_message(self.cfg, self.tg, msg(text="/new bolts"), self.state)
+        t2 = self.tg.topics["bolts"]
+        for tid, text in ((t1, "about apples"), (t2, "about bolts")):
             main.handle_message(self.cfg, self.tg,
                                 msg(text=text, message_thread_id=tid), self.state)
-        self.assertEqual([m["content"] for m in self.state.get_history(100, 11)],
+        main.handle_message(self.cfg, self.tg, msg(text="in all"), self.state)
+        # disjoint histories; All has none
+        self.assertEqual([m["content"] for m in self.state.get_history(100, t1)],
                          ["about apples", "a1"])
-        self.assertEqual([m["content"] for m in self.state.get_history(100, 22)],
+        self.assertEqual([m["content"] for m in self.state.get_history(100, t2)],
                          ["about bolts", "a1"])
-        self.assertEqual([m["content"] for m in self.state.get_history(100, None)],
-                         ["main chat text", "a1"])
+        self.assertEqual(self.state.history.get((100, None)), None)
+        self.assertEqual(chat_mock.call_count, 2)
         # every provider call saw ONLY its own session's messages
         for call, own in zip(chat_mock.call_args_list,
-                             ("about apples", "about bolts", "main chat text")):
+                             ("about apples", "about bolts")):
             user_texts = [m["content"] for m in call[0][3]
                           if m.get("role") == "user"]
             self.assertEqual(user_texts, [own])
-        # one anonymized app-wide x-opencode-session (no chat/topic ids leave
-        # the machine) - isolation is by payload content, asserted above
+        # one anonymized app-wide x-opencode-session; distinct session ids
         sids = {call[1]["session_id"] for call in chat_mock.call_args_list}
         self.assertEqual(sids, {main.SESSION_ID})
+        self.assertNotEqual(self.state.meta[(100, t1)]["session_id"],
+                            self.state.meta[(100, t2)]["session_id"])
 
-    @mock.patch.object(providers, "chat", return_value=("fresh", "", None))
-    def test_manually_created_topic_gets_fresh_session(self, chat_mock):
-        """A topic the user created by hand (not via /new) starts a new
-        isolated session on the first message."""
+    @mock.patch.object(providers, "chat")
+    def test_manual_topic_rejected_until_bound(self, chat_mock):
+        """Hand-made topics are unbound: rejected with a hint until bound
+        (group 20) - and they never auto-create sessions anymore (group 9
+        behavior superseded)."""
         main.handle_message(self.cfg, self.tg,
                             msg(text="hello from my own topic",
                                 message_thread_id=4242), self.state)
-        self.assertEqual([m["content"] for m in self.state.get_history(100, 4242)],
-                         ["hello from my own topic", "fresh"])
-        # nothing leaked from/to any other session
-        self.assertEqual(self.state.get_history(100, None), [])
-        # it is NOT registered as a bot-created topic (/reset-all won't delete it)
+        chat_mock.assert_not_called()
+        self.assertFalse(self.state.session_at(100, 4242))
+        self.assertIn("bound to no session", self.tg.sent[-1][1])
+        # session-scoped commands rejected there too...
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/context", message_thread_id=4242), self.state)
+        self.assertIn("bound to no session", self.tg.sent[-1][1])
+        # ...but /session (the binder) runs
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/session", message_thread_id=4242), self.state)
+        self.assertIn("no other sessions", self.tg.sent[-1][1])
+        # not registered as a bot-created topic (/reset-all won't touch it)
         self.assertNotIn(4242, self.state.topics.get(100, []))
 
-    def test_new_auto_names_sessions(self):
-        self.state.topics_enabled = True
+    @mock.patch.object(providers, "chat", return_value=("a1", "", None))
+    def test_new_placeholder_until_title(self, chat_mock):
+        # group 19: placeholder now, agent title after the first message
         main.handle_message(self.cfg, self.tg, msg(text="/new"), self.state)
-        main.handle_message(self.cfg, self.tg, msg(text="/new"), self.state)
-        self.assertIn("Session 1", self.tg.topics)
-        self.assertIn("Session 2", self.tg.topics)
+        self.assertIn("New session", self.tg.topics)
+        main.handle_message(self.cfg, self.tg, msg(text="/new named trip"), self.state)
+        self.assertIn("named trip", self.tg.topics)
 
-    def test_new_without_topics_clears_history(self):
-        self.state.topics_enabled = False
-        self.state.get_history(100, None).append({"role": "user", "content": "old"})
+    @mock.patch.object(providers, "chat", return_value=("old answer", "", None))
+    def test_new_in_normal_flow_parks_and_starts_blank(self, chat_mock):
+        self.cfg.topic_flow = False
+        main.handle_message(self.cfg, self.tg, msg(text="old conversation"),
+                            self.state)
+        old_sid = self.state.ensure_meta(100, None)["session_id"]
         main.handle_message(self.cfg, self.tg, msg(text="/new"), self.state)
+        # blank session active in place
         self.assertEqual(self.state.get_history(100, None), [])
-        self.assertIn("topics are not enabled", self.tg.sent[-1][1])
-        self.assertEqual(self.tg.topics, {})
+        self.assertNotEqual(self.state.meta[(100, None)]["session_id"], old_sid)
+        # the old session is parked (kept) and recoverable via /session
+        parked = [(k, m) for k, m in self.state.meta.items()
+                  if m.get("session_id") == old_sid]
+        self.assertEqual(len(parked), 1)
+        self.assertIsNotNone(parked[0][0][1])  # no longer in the main slot
+        self.assertEqual([m["content"] for m in
+                          self.state.history[parked[0][0]]],
+                         ["old conversation", "old answer"])
+        self.assertIn("recover it with /session", self.tg.sent[-1][1])
+        self.assertEqual(self.tg.topics, {})  # no topics in normal flow
 
-    def test_rename_current_topic(self):
-        main.handle_message(self.cfg, self.tg, msg(text="/rename project x", message_thread_id=77), self.state)
-        self.assertEqual(self.tg.renamed, [(100, 77, "project x")])
-        self.assertIn("renamed", self.tg.sent[-1][1])
-
-    def test_rename_in_main_chat_rejected(self):
-        main.handle_message(self.cfg, self.tg, msg(text="/rename nope"), self.state)
-        self.assertEqual(self.tg.renamed, [])
-        self.assertIn("nothing to rename", self.tg.sent[-1][1])
-
-    def test_rename_requires_name(self):
-        main.handle_message(self.cfg, self.tg, msg(text="/rename", message_thread_id=77), self.state)
-        self.assertEqual(self.tg.renamed, [])
-        self.assertIn("usage", self.tg.sent[-1][1])
-
-    def test_new_registers_topic_for_reset(self):
-        self.state.topics_enabled = True
+    @mock.patch.object(providers, "chat", return_value=("a1", "", None))
+    def test_new_registers_topic_for_reset(self, chat_mock):
         main.handle_message(self.cfg, self.tg, msg(text="/new a"), self.state)
         main.handle_message(self.cfg, self.tg, msg(text="/new b"), self.state)
         self.assertEqual(len(self.state.topics[100]), 2)
+
+    # ------------------------------------------------ /rename (mirror, group 22)
+
+    def test_rename_mirrors_topic_and_session(self):
+        main.handle_message(self.cfg, self.tg, msg(text="/new work"), self.state)
+        tid = self.tg.topics["work"]
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/rename project x", message_thread_id=tid),
+                            self.state)
+        self.assertEqual(self.tg.renamed, [(100, tid, "project x")])
+        self.assertEqual(self.state.meta[(100, tid)]["name"], "project x")
+        self.assertIn("renamed", self.tg.sent[-1][1])
+
+    def test_rename_in_main_chat_without_session_rejected(self):
+        self.cfg.topic_flow = False  # in All (flow on) this is gate-rejected
+        main.handle_message(self.cfg, self.tg, msg(text="/rename nope"), self.state)
+        self.assertEqual(self.tg.renamed, [])
+        self.assertIn("no active session", self.tg.sent[-1][1])
+
+    @mock.patch.object(providers, "chat", return_value=("hi", "", None))
+    def test_rename_session_in_main_chat(self, chat_mock):
+        self.cfg.topic_flow = False
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        main.handle_message(self.cfg, self.tg, msg(text="/rename my trip"),
+                            self.state)
+        self.assertEqual(self.tg.renamed, [])  # no topic to rename
+        self.assertEqual(self.state.meta[(100, None)]["name"], "my trip")
+        self.assertIn("renamed", self.tg.sent[-1][1])
+
+    def test_rename_requires_name(self):
+        main.handle_message(self.cfg, self.tg, msg(text="/new work"), self.state)
+        tid = self.tg.topics["work"]
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/rename", message_thread_id=tid), self.state)
+        self.assertEqual(self.tg.renamed, [])
+        self.assertIn("usage", self.tg.sent[-1][1])
 
 
 class TestResetAll(unittest.TestCase):
@@ -309,7 +381,9 @@ class TestResetAll(unittest.TestCase):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config()
+        disable_titles(self)
         self.state.topics_enabled = True
+        self.cfg.topic_flow = True  # /new creates topics in topic flow
 
     def _initiate(self):
         main.handle_message(self.cfg, self.tg, msg(text="/reset-all"), self.state)
@@ -380,8 +454,11 @@ class TestDeleteCommand(unittest.TestCase):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config()
+        disable_titles(self)
 
     def test_delete_clears_context_keeps_topic(self):
+        self.cfg.topic_flow = True
+        self.state.create_session(100, 77, name="work")
         hist = self.state.get_history(100, 77)
         hist.append({"role": "user", "content": "x"})
         self.state.model[(100, 77)] = "go/m"
@@ -390,8 +467,9 @@ class TestDeleteCommand(unittest.TestCase):
         self.assertNotIn((100, 77), self.state.model)
         self.assertIn("session deleted", self.tg.sent[-1][1])
         self.assertIn("delete it manually", self.tg.sent[-1][1])
-        # topic untouched
+        # topic untouched, but now unbound (no session lives there)
         self.assertEqual(self.state.topics, {})
+        self.assertFalse(self.state.session_at(100, 77))
 
     def test_delete_without_store_ok(self):
         main.handle_message(self.cfg, self.tg, msg(text="/delete"), self.state)
@@ -403,6 +481,7 @@ class TestCompact(unittest.TestCase):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config()
+        disable_titles(self)
 
     def _seed(self, n=10, thread=None):
         hist = self.state.get_history(100, thread)
@@ -443,6 +522,7 @@ class TestStreaming(unittest.TestCase):
     def setUp(self):
         self.tg = FakeTG()
         self.state = main.State(True)
+        disable_titles(self)
 
     @mock.patch.object(providers, "chat_stream")
     def test_stream_drafts_then_final(self, stream_mock):
@@ -678,6 +758,7 @@ class TestToolLoop(unittest.TestCase):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config(stream_drafts=False)
+        disable_titles(self)
 
     @mock.patch.object(providers, "chat")
     def test_tool_round_then_answer(self, chat_mock):
@@ -780,6 +861,9 @@ class TestReplyTo(unittest.TestCase):
 class TestEditStreaming(unittest.TestCase):
     """Item 8: non-private chats stream via send + editMessageText(rich)."""
 
+    def setUp(self):
+        disable_titles(self)
+
     @mock.patch.object(providers, "chat_stream")
     def test_group_stream_uses_edits_not_drafts(self, stream_mock):
         stream_mock.return_value = iter([("reasoning", "hmm about that"),
@@ -823,6 +907,7 @@ class TestProviderPriority(unittest.TestCase):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config()
+        disable_titles(self)
 
     def test_default_model_is_go(self):
         self.assertEqual(make_config().default_model, "go/mimo-v2.6-flash")
@@ -868,6 +953,7 @@ class TestUsageAccounting(unittest.TestCase):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config()
+        disable_titles(self)
 
     @mock.patch.object(providers, "price_for")
     @mock.patch.object(providers, "chat")
@@ -919,6 +1005,7 @@ class TestContextCostCommands(unittest.TestCase):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config()
+        disable_titles(self)
 
     @mock.patch.object(providers, "chat", return_value=("a", "", None))
     def test_context_shows_usage_without_cost(self, _):
@@ -1025,6 +1112,466 @@ class TestSessionMeta(unittest.TestCase):
         store.delete_chat(5)
         self.assertEqual(store.load_meta(), {})
         store.close()
+
+
+class TestTopicFlowMode(unittest.TestCase):
+    """P4 group 22: /topic enter/exit with typed confirmations + getMe gates."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        self.cfg = make_config()
+        disable_titles(self)
+
+    def _confirm(self, answer):
+        main.handle_message(self.cfg, self.tg, msg(text="/topic"), self.state)
+        self.assertIn("type <code>yes</code>", self.tg.sent[-1][1])
+        main.handle_message(self.cfg, self.tg, msg(text=answer), self.state)
+
+    def test_enter_flow_after_confirmation(self):
+        self._confirm("yes")
+        self.assertTrue(self.cfg.topic_flow)
+        self.assertIn("topic flow is <b>on</b>", self.tg.sent[-1][1])
+        self.assertNotIn((100, None), self.state.prompts)
+
+    def test_enter_refused_when_users_can_create_topics(self):
+        self.tg.me["allows_users_to_create_topics"] = True
+        self._confirm("yes")
+        self.assertFalse(self.cfg.topic_flow)
+        self.assertIn("Disallow users to create topics", self.tg.sent[-1][1])
+
+    def test_enter_refused_when_threaded_mode_off(self):
+        self.tg.me["has_topics_enabled"] = False
+        self._confirm("yes")
+        self.assertFalse(self.cfg.topic_flow)
+        self.assertIn("Threaded mode is off", self.tg.sent[-1][1])
+
+    def test_no_cancels(self):
+        self._confirm("no")
+        self.assertFalse(self.cfg.topic_flow)
+        self.assertIn("cancelled", self.tg.sent[-1][1])
+
+    def test_command_cancels_pending_prompt_and_runs(self):
+        main.handle_message(self.cfg, self.tg, msg(text="/topic"), self.state)
+        self.assertIn((100, None), self.state.prompts)
+        main.handle_message(self.cfg, self.tg, msg(text="/help"), self.state)
+        self.assertNotIn((100, None), self.state.prompts)
+        self.assertIn("Keirai", self.tg.sent[-1][1])
+        self.assertFalse(self.cfg.topic_flow)
+
+    @mock.patch.object(providers, "chat", return_value=("answer", "", None))
+    def test_plain_message_cancels_prompt_as_do_nothing(self, chat_mock):
+        main.handle_message(self.cfg, self.tg, msg(text="/topic"), self.state)
+        main.handle_message(self.cfg, self.tg, msg(text="hello instead"), self.state)
+        self.assertFalse(self.cfg.topic_flow)  # no mode change
+        self.assertNotIn((100, None), self.state.prompts)
+        # the message was answered normally (the "do nothing" choice)
+        self.assertTrue(any(s[1].get("markdown") == "answer"
+                            for s in self.tg.rich))
+
+    @mock.patch.object(providers, "chat", return_value=("answer", "", None))
+    def test_leave_flow(self, chat_mock):
+        self.cfg.topic_flow = True
+        main.handle_message(self.cfg, self.tg, msg(text="/topic"), self.state)
+        self.assertIn("leave topic flow", self.tg.sent[-1][1])
+        main.handle_message(self.cfg, self.tg, msg(text="yes"), self.state)
+        self.assertFalse(self.cfg.topic_flow)
+        self.assertIn("topic flow is <b>off</b>", self.tg.sent[-1][1])
+
+
+class TestDeliveryRules(unittest.TestCase):
+    """P4 group 20: mode gates, per-view hints, command availability."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        self.cfg = make_config()
+        disable_titles(self)
+
+    @mock.patch.object(providers, "chat")
+    def test_flow_off_topics_inert_for_plain_and_commands(self, chat_mock):
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="hello", message_thread_id=7), self.state)
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/help", message_thread_id=7), self.state)
+        chat_mock.assert_not_called()
+        hints = [t for _c, t, _th in self.tg.sent]
+        self.assertEqual(len(hints), 2)
+        for t in hints:
+            self.assertIn("topic flow is off", t)
+
+    @mock.patch.object(providers, "chat")
+    def test_flow_on_all_gates(self, chat_mock):
+        self.cfg.topic_flow = True
+        # plain message -> hint, no answer
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        self.assertIn("topic flow is on", self.tg.sent[-1][1])
+        chat_mock.assert_not_called()
+        # session-scoped commands -> needs-session hint (incl. /stop)
+        for command in ("/compact", "/stop", "/delete", "/context", "/cost"):
+            main.handle_message(self.cfg, self.tg, msg(text=command), self.state)
+            self.assertIn("needs a session", self.tg.sent[-1][1], command)
+        # /model global is chat-wide and allowed in All
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/model global go/glm-5.3-flash"), self.state)
+        self.assertEqual(self.cfg.default_model, "go/glm-5.3-flash")
+        self.assertIn("default model set", self.tg.sent[-1][1])
+        # allowed command: /session runs (empty list)
+        main.handle_message(self.cfg, self.tg, msg(text="/session"), self.state)
+        self.assertIn("no other sessions", self.tg.sent[-1][1])
+        chat_mock.assert_not_called()
+
+    @mock.patch.object(providers, "chat")
+    def test_flow_on_media_in_all_hinted(self, chat_mock):
+        self.cfg.topic_flow = True
+        m = msg(text=None, photo=[{"file_id": "f1", "file_size": 100}])
+        main.handle_message(self.cfg, self.tg, m, self.state)
+        chat_mock.assert_not_called()
+        self.assertIn("topic flow is on", self.tg.sent[-1][1])
+
+    @mock.patch.object(providers, "chat")
+    def test_forum_topic_created_registered_not_hinted(self, chat_mock):
+        m = msg(text="", message_thread_id=999)
+        m["forum_topic_created"] = {"name": "client topic"}
+        main.handle_message(self.cfg, self.tg, m, self.state)
+        self.assertIn(999, self.state.topics[100])
+        self.assertEqual(self.state.topic_names[(100, 999)], "client topic")
+        self.assertEqual(self.tg.sent, [])  # service messages never hinted
+
+
+class TestSessionCommands(unittest.TestCase):
+    """P4 group 22: /session listing, switching matrix, prompts, ping."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        self.cfg = make_config()
+        disable_titles(self)
+
+    def _mk(self, slot, text, name=None, updated=0.0):
+        """Session at a slot with one exchange, fixed last-active time."""
+        self.state.create_session(100, slot, name=name)
+        hist = self.state.get_history(100, slot)
+        hist.append({"role": "user", "content": text})
+        hist.append({"role": "assistant", "content": "ok"})
+        self.state.updated[(100, slot)] = updated
+        return self.state.meta[(100, slot)]["session_id"]
+
+    # ------------------------------------------------ listing + normal flow
+
+    @mock.patch.object(providers, "chat")
+    def test_list_excludes_current_and_formats(self, chat_mock):
+        sid_main = self._mk(None, "main conversation", name="main session",
+                            updated=300)
+        self._mk(-1, "older topic talk", name="older", updated=100)
+        sid_a = self._mk(-2, "recent talk about trains", name="recent",
+                         updated=200)
+        main.handle_message(self.cfg, self.tg, msg(text="/session"), self.state)
+        text = self.tg.sent[-1][1]
+        self.assertIn("page 1/1", text)
+        self.assertIn("<b>recent</b>", text)
+        self.assertIn(sid_a, text)
+        self.assertIn("older", text)
+        self.assertNotIn(sid_main, text)      # current session excluded
+        self.assertIn("recent talk about tra", text)  # preview (truncated)
+        self.assertIn("1970", text)           # timestamp rendered
+
+    @mock.patch.object(providers, "chat")
+    def test_list_paging_and_switch_by_n(self, chat_mock):
+        self._mk(None, "current", name="current", updated=999)
+        sids = [self._mk(-(i + 1), "talk %d" % (7 - i), name="s%d" % (7 - i),
+                         updated=(7 - i) * 100) for i in range(7)]
+        # page 1: 5 of 7 rows
+        main.handle_message(self.cfg, self.tg, msg(text="/session"), self.state)
+        self.assertIn("page 1/2", self.tg.sent[-1][1])
+        # page 2: last 2
+        main.handle_message(self.cfg, self.tg, msg(text="/session page 2"),
+                            self.state)
+        text = self.tg.sent[-1][1]
+        self.assertIn("page 2/2", text)
+        # /session 1 on page 2 -> row with updated=200 (second in sort order)
+        main.handle_message(self.cfg, self.tg, msg(text="/session 1"),
+                            self.state)
+        expected = sids[5]  # sorted desc: 700,600,500,400,300,200,100 -> page2[0]=200
+        self.assertEqual(self.state.meta[(100, None)]["session_id"], expected)
+        self.assertIn("switched to", self.tg.sent[-1][1])
+        # out-of-range N on the page
+        main.handle_message(self.cfg, self.tg, msg(text="/session 9"),
+                            self.state)
+        self.assertIn("no session #9 on this page", self.tg.sent[-1][1])
+
+    @mock.patch.object(providers, "chat")
+    def test_switch_by_id_and_unknown_id(self, chat_mock):
+        self._mk(None, "current", name="current", updated=999)
+        sid = self._mk(-1, "other talk", name="other", updated=100)
+        main.handle_message(self.cfg, self.tg, msg(text="/session %s" % sid),
+                            self.state)
+        self.assertEqual(self.state.meta[(100, None)]["session_id"], sid)
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/session nope-not-real"), self.state)
+        self.assertIn("no session with id", self.tg.sent[-1][1])
+
+    @mock.patch.object(providers, "chat")
+    def test_already_active_is_noop(self, chat_mock):
+        sid = self._mk(None, "current", name="current", updated=999)
+        main.handle_message(self.cfg, self.tg, msg(text="/session %s" % sid),
+                            self.state)
+        self.assertIn("already active", self.tg.sent[-1][1])
+
+    # ------------------------------------------------ topic-flow switching
+
+    @mock.patch.object(providers, "chat")
+    def test_unbound_session_from_all_creates_topic_immediately(self, chat_mock):
+        self.cfg.topic_flow = True
+        sid = self._mk(-1, "parked talk", name="parked", updated=100)
+        main.handle_message(self.cfg, self.tg, msg(text="/session"), self.state)
+        main.handle_message(self.cfg, self.tg, msg(text="/session 1"), self.state)
+        self.assertIn("parked", self.tg.topics)           # topic named after it
+        tid = self.tg.topics["parked"]
+        self.assertEqual(self.state.sid_slot(100, sid), tid)
+        self.assertEqual(self.tg.sent[-1][2], tid)         # welcome in the topic
+
+    @mock.patch.object(providers, "chat")
+    def test_bound_session_from_all_prompts_ping(self, chat_mock):
+        self.cfg.topic_flow = True
+        self._mk(77, "bound talk", name="bound", updated=100)
+        main.handle_message(self.cfg, self.tg, msg(text="/session"), self.state)
+        main.handle_message(self.cfg, self.tg, msg(text="/session 1"), self.state)
+        self.assertIn((100, None), self.state.prompts)
+        self.assertIn("ping", self.tg.sent[-1][1])
+        main.handle_message(self.cfg, self.tg, msg(text="1"), self.state)
+        self.assertNotIn((100, None), self.state.prompts)
+        # ping landed in topic 77, confirmation came back in All
+        self.assertIn("ping", self.tg.sent[-2][1])
+        self.assertEqual(self.tg.sent[-2][2], 77)
+        self.assertIn("topic found", self.tg.sent[-1][1])
+
+    @mock.patch.object(providers, "chat")
+    def test_ping_on_dead_topic_recovers(self, chat_mock):
+        self.cfg.topic_flow = True
+        sid = self._mk(88, "dead talk", name="dead", updated=100)
+        self.state.topics[100] = [88]
+        self.state.topic_names[(100, 88)] = "dead"
+        self.tg.fail_threads.add(88)  # sending there -> thread not found
+        main.handle_message(self.cfg, self.tg, msg(text="/session"), self.state)
+        main.handle_message(self.cfg, self.tg, msg(text="/session 1"), self.state)
+        main.handle_message(self.cfg, self.tg, msg(text="1"), self.state)
+        # dead topic unregistered, session relocated into a fresh topic
+        self.assertNotIn(88, self.state.topics[100])
+        new_tid = self.tg.topics["dead"]
+        self.assertNotEqual(new_tid, 88)
+        self.assertEqual(self.state.sid_slot(100, sid), new_tid)
+
+    @mock.patch.object(providers, "chat", return_value=("answer", "", None))
+    def test_unbound_session_in_topic_three_option_prompt(self, chat_mock):
+        # a main-chat session that becomes unbound once flow is entered
+        sid_main = self._mk(None, "main talk", name="main talk", updated=999)
+        self.cfg.topic_flow = True
+        main.handle_message(self.cfg, self.tg, msg(text="/new here"), self.state)
+        tid = self.tg.topics["here"]
+        sid_here = self.state.meta[(100, tid)]["session_id"]
+        # viewing from inside the topic: list excludes current, shows main
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/session", message_thread_id=tid), self.state)
+        text = self.tg.sent[-1][1]
+        self.assertIn("main talk", text)
+        self.assertNotIn(sid_here, text)
+        # selecting it -> 3-option prompt (switch here / create new / nothing)
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/session 1", message_thread_id=tid),
+                            self.state)
+        prompt_text = self.tg.sent[-1][1]
+        for expected in ("switch here", "create a new topic", "do nothing"):
+            self.assertIn(expected, prompt_text)
+        # "1" = switch here: main session moves into this topic, occupant parks
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="1", message_thread_id=tid), self.state)
+        self.assertEqual(self.state.sid_slot(100, sid_main), tid)
+        # old session parked somewhere negative
+        parked = self.state.sid_slot(100, sid_here)
+        self.assertIsNotNone(parked)
+        self.assertLess(parked, 0)
+        self.assertIn("switched here", self.tg.sent[-1][1])
+
+    @mock.patch.object(providers, "chat", return_value=("answer", "", None))
+    def test_prompt_do_nothing_via_plain_message(self, chat_mock):
+        self.cfg.topic_flow = True
+        self._mk(77, "bound talk", name="bound", updated=100)
+        main.handle_message(self.cfg, self.tg, msg(text="/session"), self.state)
+        main.handle_message(self.cfg, self.tg, msg(text="/session 1"), self.state)
+        self.assertIn((100, None), self.state.prompts)
+        # a plain message in All = do nothing + handled normally (hint)
+        main.handle_message(self.cfg, self.tg, msg(text="actually hello"),
+                            self.state)
+        self.assertNotIn((100, None), self.state.prompts)
+        self.assertIn("topic flow is on", self.tg.sent[-1][1])
+        chat_mock.assert_not_called()
+
+    @mock.patch.object(providers, "chat", return_value=("answer", "", None))
+    def test_prompts_are_per_slot(self, chat_mock):
+        self.cfg.topic_flow = True
+        main.handle_message(self.cfg, self.tg, msg(text="/new alpha"), self.state)
+        t1 = self.tg.topics["alpha"]
+        main.handle_message(self.cfg, self.tg, msg(text="/new beta"), self.state)
+        t2 = self.tg.topics["beta"]
+        # open a prompt in t1 (the only other session is t2's)
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/session", message_thread_id=t1), self.state)
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/session 1", message_thread_id=t1), self.state)
+        self.assertIn((100, t1), self.state.prompts)
+        # a command in t2 does NOT cancel t1's prompt
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="/help", message_thread_id=t2), self.state)
+        self.assertIn((100, t1), self.state.prompts)
+        # nor does a plain message in t2 (answered normally in t2)
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="over here", message_thread_id=t2), self.state)
+        self.assertIn((100, t1), self.state.prompts)
+        self.assertTrue(any(s[1].get("markdown") == "answer"
+                            for s in self.tg.rich))
+        # ...but a message in t1 cancels ITS prompt
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="back in t1", message_thread_id=t1), self.state)
+        self.assertNotIn((100, t1), self.state.prompts)
+
+
+class TestSessionTitles(unittest.TestCase):
+    """P4 group 19: agent-generated session titles after the first message."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        self.cfg = make_config()
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_title_after_first_message_then_stops(self, chat_mock, price_mock):
+        chat_mock.side_effect = [("the answer", "", None),
+                                 ("  Trip Planning!  ", "", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="plan my trip"),
+                            self.state)
+        m = self.state.meta[(100, None)]
+        self.assertEqual(m["name"], "Trip Planning!")
+        self.assertEqual(chat_mock.call_count, 2)
+        # second turn: no more naming calls
+        main.handle_message(self.cfg, self.tg, msg(text="and hotels"),
+                            self.state)
+        self.assertEqual(chat_mock.call_count, 3)
+        self.assertEqual(self.state.meta[(100, None)]["name"], "Trip Planning!")
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_new_with_explicit_name_skips_naming(self, chat_mock, price_mock):
+        chat_mock.return_value = ("answer", "", None)
+        main.handle_message(self.cfg, self.tg, msg(text="/new my trip"),
+                            self.state)
+        main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
+        self.assertEqual(chat_mock.call_count, 1)  # only the answer call
+        self.assertEqual(self.state.meta[(100, None)]["name"], "my trip")
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_title_renames_topic_in_flow(self, chat_mock, price_mock):
+        self.cfg.topic_flow = True
+        chat_mock.side_effect = [("answer", "", None), ("Cats", "", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="/new"), self.state)
+        tid = self.tg.topics["New session"]
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="tell me about cats", message_thread_id=tid),
+                            self.state)
+        self.assertEqual(self.state.meta[(100, tid)]["name"], "Cats")
+        self.assertIn((100, tid, "Cats"), self.tg.renamed)  # topic mirrors it
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_media_only_message_named_from_media(self, chat_mock, price_mock):
+        chat_mock.side_effect = [("answer", "", None),
+                                 ("Sunset Photo", "", None)]
+        m = msg(text=None, photo=[{"file_id": "f1", "file_size": 100}])
+        main.handle_message(self.cfg, self.tg, m, self.state)
+        self.assertEqual(self.state.meta[(100, None)]["name"], "Sunset Photo")
+        # the naming call got a media descriptor (vision off in this stub)
+        naming_msgs = chat_mock.call_args_list[1][0][3]
+        self.assertIn("media file", naming_msgs[1]["content"])
+
+    @mock.patch.object(providers, "price_for")
+    @mock.patch.object(providers, "chat")
+    def test_media_only_message_with_vision_sends_image(self, chat_mock,
+                                                        price_mock):
+        price_mock.return_value = {"image": True}
+        chat_mock.side_effect = [("answer", "", None), ("Nice Pic", "", None)]
+        m = msg(text=None, photo=[{"file_id": "f1", "file_size": 100}])
+        main.handle_message(self.cfg, self.tg, m, self.state)
+        naming_content = chat_mock.call_args_list[1][0][3][1]["content"]
+        self.assertIsInstance(naming_content, list)
+        self.assertTrue(any(p.get("type") == "image_url"
+                            for p in naming_content))
+        self.assertEqual(self.state.meta[(100, None)]["name"], "Nice Pic")
+
+
+class TestConfigPersistence(unittest.TestCase):
+    """topic_flow + /model global: surgical config.toml writes (comments kept)."""
+
+    def _cfg(self, d):
+        import config as config_mod
+        import tomllib
+        path = os.path.join(d, "config.toml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('# my comment\nbot_token = "t"\n'
+                    'default_model = "zen/glm-5.3-flash"\n\n'
+                    "[providers.zen]\napi_key = \"zk\"\n")
+        with open(path, "rb") as f:
+            return config_mod.Config(tomllib.load(f), path=path), path
+
+    def test_set_flow_persists_and_survives_reload(self):
+        import config as config_mod
+        import tomllib
+        with tempfile.TemporaryDirectory() as d:
+            cfg, path = self._cfg(d)
+            main._set_flow(cfg, True)
+            self.assertTrue(cfg.topic_flow)
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("topic_flow = true", content)
+            self.assertIn("# my comment", content)   # comments preserved
+            with open(path, "rb") as f:
+                reloaded = config_mod.Config(tomllib.load(f), path=path)
+            self.assertTrue(reloaded.topic_flow)     # survives a restart
+
+    @mock.patch.object(providers, "chat")
+    def test_model_global_writes_config(self, chat_mock):
+        import config as config_mod
+        import tomllib
+        with tempfile.TemporaryDirectory() as d:
+            cfg, path = self._cfg(d)
+            tg = FakeTG()
+            main.handle_message(cfg, tg,
+                                msg(text="/model global go/mimo-v2.6-flash"),
+                                main.State(True))
+            self.assertEqual(cfg.default_model, "go/mimo-v2.6-flash")
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn('default_model = "go/mimo-v2.6-flash"', content)
+            self.assertIn("# my comment", content)
+            self.assertNotIn("zen/glm-5.3-flash", content)
+            self.assertIn("written to", tg.sent[-1][1])
+            with open(path, "rb") as f:
+                reloaded = config_mod.Config(tomllib.load(f), path=path)
+            self.assertEqual(reloaded.default_model, "go/mimo-v2.6-flash")
+
+    def test_write_value_inserts_missing_key_at_top_level(self):
+        import config as config_mod
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.toml")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('bot_token = "t"\n\n[providers.zen]\napi_key = "k"\n')
+            cfg = config_mod.Config({}, path=path)
+            config_mod.write_value(cfg, "topic_flow", True)
+            with open(path, encoding="utf-8") as f:
+                lines = [l for l in f.read().splitlines() if l.strip()]
+            self.assertEqual(lines[1], "topic_flow = true")  # before any section
+            self.assertEqual(lines[2], "[providers.zen]")
 
 
 if __name__ == "__main__":
