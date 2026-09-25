@@ -60,7 +60,7 @@ P0 + P1 + P2 complete and tested (157 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
-- Sessions via Telegram topics (Bot API 9.3 private-chat topics, needs @BotFather toggle): `/new [name]`, `/rename <name>`, per-topic context isolation; `/reset-all` wipes everything (2-string confirmation, deletes tracked topics)
+- Sessions via Telegram topics (Bot API 9.3+ private-chat topics - enable "Threaded mode" in the @BotFather Mini App): `/new [name]`, `/rename <name>`, per-topic context isolation; `/reset-all` wipes everything (2-string confirmation, deletes tracked topics)
 - AI answers sent as Bot API 10.1 Rich Messages: markdown passthrough (native tables, task lists, headings, formulas, 32k chars), thinking as collapsible `<details>`; `rich_messages` config toggle + automatic fallback to regular messages
 - Live streaming in private chats via `sendRichMessageDraft` (reasoning as `<tg-thinking>`, then answer tokens; `stream_drafts` toggle, falls back to blocking)
 - Session persistence in SQLite (`sessions.db`): history, per-session model, topic registry - survives restarts; `/delete` clears one session's context

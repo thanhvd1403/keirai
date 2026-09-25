@@ -114,7 +114,8 @@ class Telegram:
 
     # ------------------------------------------------------------ topics
     # Works in forum supergroups and (Bot API 9.3+) in private chats when
-    # topic mode is enabled for the bot via @BotFather (getMe.has_topics_enabled).
+    # topic mode is enabled for the bot via the "Threaded mode" setting in the
+    # @BotFather Mini App (getMe.has_topics_enabled).
 
     def create_topic(self, chat_id, name):
         return self.call("createForumTopic", {"chat_id": chat_id, "name": name})

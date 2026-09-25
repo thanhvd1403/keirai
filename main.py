@@ -137,8 +137,9 @@ def build_help():
             lines.append("/%s - %s" % (name, desc))
     lines += [
         "",
-        "Each topic = one session with its own context. Enable topics for the bot "
-        "via @BotFather to use sessions in this private chat.",
+        "Each topic = one session with its own context. Enable Topics by turning "
+        "on Threaded mode for the bot in the @BotFather Mini App "
+        "(t.me/BotFather?startapp).",
         "",
         "Send a photo to talk about it. Send media with caption <code>media_test</code> "
         "to test the media round-trip.",
@@ -262,8 +263,9 @@ def cmd_new(cfg, tg, msg, thread_id, state):
         state.history.pop(state.chat_key(chat_id, thread_id), None)
         state.model.pop(state.chat_key(chat_id, thread_id), None)
         tg.send(chat_id, "topics are not enabled for this bot - "
-                         "session cleared here instead. Enable topics via "
-                         "@BotFather to get one topic per session.", thread_id)
+                         "session cleared here instead. Turn on Threaded mode "
+                         "for the bot in the @BotFather Mini App to get one "
+                         "topic per session.", thread_id)
         return
     try:
         topic = tg.create_topic(chat_id, name)
@@ -977,7 +979,9 @@ def main():
         me = tg.get_me()
         state.topics_enabled = bool(me.get("has_topics_enabled"))
         log.info("bot @%s ready (private-chat topics: %s)",
-                 me.get("username", "?"), "on" if state.topics_enabled else "off - enable via @BotFather")
+                 me.get("username", "?"),
+                 "on" if state.topics_enabled else
+                 "off - enable Threaded mode in the @BotFather Mini App")
     except tg_mod.TelegramError as e:
         log.error("getMe failed: %s (continuing without topic support)", e)
     try:

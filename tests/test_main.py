@@ -228,6 +228,44 @@ class TestSessions(unittest.TestCase):
         self.assertEqual([m["content"] for m in self.state.get_history(100, tid)], ["hello", "a1"])
         self.assertEqual([m["content"] for m in self.state.get_history(100, None)], ["main chat", "a1"])
 
+    @mock.patch.object(providers, "chat", return_value=("a1", "", None))
+    def test_two_topics_and_main_fully_isolated(self, chat_mock):
+        """Two topics + main chat: histories, provider payloads and provider
+        session ids are completely disjoint - no cross-contamination."""
+        for tid, text in ((11, "about apples"), (22, "about bolts"),
+                          (None, "main chat text")):
+            main.handle_message(self.cfg, self.tg,
+                                msg(text=text, message_thread_id=tid), self.state)
+        self.assertEqual([m["content"] for m in self.state.get_history(100, 11)],
+                         ["about apples", "a1"])
+        self.assertEqual([m["content"] for m in self.state.get_history(100, 22)],
+                         ["about bolts", "a1"])
+        self.assertEqual([m["content"] for m in self.state.get_history(100, None)],
+                         ["main chat text", "a1"])
+        # every provider call saw ONLY its own session's messages
+        for call, own in zip(chat_mock.call_args_list,
+                             ("about apples", "about bolts", "main chat text")):
+            user_texts = [m["content"] for m in call[0][3]
+                          if m.get("role") == "user"]
+            self.assertEqual(user_texts, [own])
+        # distinct x-opencode-session per topic (no shared provider session)
+        sids = {call[1]["session_id"] for call in chat_mock.call_args_list}
+        self.assertEqual(len(sids), 3)
+
+    @mock.patch.object(providers, "chat", return_value=("fresh", "", None))
+    def test_manually_created_topic_gets_fresh_session(self, chat_mock):
+        """A topic the user created by hand (not via /new) starts a new
+        isolated session on the first message."""
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="hello from my own topic",
+                                message_thread_id=4242), self.state)
+        self.assertEqual([m["content"] for m in self.state.get_history(100, 4242)],
+                         ["hello from my own topic", "fresh"])
+        # nothing leaked from/to any other session
+        self.assertEqual(self.state.get_history(100, None), [])
+        # it is NOT registered as a bot-created topic (/reset-all won't delete it)
+        self.assertNotIn(4242, self.state.topics.get(100, []))
+
     def test_new_auto_names_sessions(self):
         self.state.topics_enabled = True
         main.handle_message(self.cfg, self.tg, msg(text="/new"), self.state)
