@@ -26,6 +26,7 @@ import tools as tools_mod
 log = logging.getLogger("keirai")
 
 HISTORY_LIMIT = 24  # messages per chat kept in memory
+CHARS_PER_TOKEN = 4  # rough chars->token ratio for context estimates
 SESSION_ID = "keirai"  # anonymized x-opencode-session for the whole app (no chat ids)
 SLOT_NONE = object()  # sid_slot(): not found (None means the main-chat slot)
 TEXT_EXTS = {
@@ -903,26 +904,77 @@ def cmd_cost(cfg, tg, msg, thread_id, state):
             thread_id)
 
 
+def _model_context(cfg, model_full):
+    """The model's max context window in tokens (models.dev), or None when
+    the cache has no entry for it."""
+    provider, _, model_id = (model_full or "").partition("/")
+    if not provider or not model_id:
+        return None
+    try:
+        stats = providers.price_for(config_mod.cache_dir(cfg), provider, model_id)
+    except Exception:
+        return None
+    ctx = (stats or {}).get("context")
+    try:
+        return int(ctx) if ctx else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_limit_chars(cfg, model_full):
+    """Auto-compact threshold in chars.
+
+    Default: 100% of the model's context window (models.dev tokens x the
+    rough chars-per-token ratio). An explicit context_limit_chars in
+    config.toml overrides it; without metadata we fall back to that value."""
+    if cfg.context_limit_explicit:
+        return cfg.context_limit_chars
+    ctx = _model_context(cfg, model_full)
+    if ctx:
+        return ctx * CHARS_PER_TOKEN
+    return cfg.context_limit_chars
+
+
 def _session_report(cfg, state, chat_id, thread_id, with_cost):
-    """Shared body of /context and /cost (group 21)."""
+    """Shared body of /context and /cost (group 21).
+
+    The context line is the model's real window (models.dev, used/max in
+    tokens); the auto-compact threshold appears only on its own line."""
     key = state.chat_key(chat_id, thread_id)
     history = state.history.get(key) or []
     chars = _est_chars(history)
-    limit = cfg.context_limit_chars
     meta = state.ensure_meta(chat_id, thread_id)
     model = state.model_for(chat_id, thread_id, cfg.default_model)
     name = state.topic_names.get(key) or meta.get("name") or "session"
-    pct = int(round(chars * 100.0 / limit)) if limit else 0
+    fmt = lambda n: "{:,}".format(int(n))  # noqa: E731 - tiny local helper
+    ctx_max = _model_context(cfg, model)
+    used_tok = chars // CHARS_PER_TOKEN
+    if ctx_max:
+        pct = min(100, int(round(used_tok * 100.0 / ctx_max)))
+        context_line = ("<b>context</b>: ~%s / %s tokens (~%d%%) · %s chars · "
+                        "%d messages"
+                        % (fmt(used_tok), fmt(ctx_max), pct, fmt(chars),
+                           len(history)))
+    else:
+        context_line = ("<b>context</b>: ~%s tokens (max unknown - models.dev "
+                        "cache empty) · %s chars · %d messages"
+                        % (fmt(used_tok), fmt(chars), len(history)))
+    limit = _compact_limit_chars(cfg, model)
     would_compact = chars > limit and len(history) > 6
+    if cfg.context_limit_explicit:
+        at = "%s chars (context_limit_chars)" % fmt(limit)
+    elif ctx_max:
+        at = "100%% of the model window (%s tokens)" % fmt(ctx_max)
+    else:
+        at = "%s chars (models.dev cache empty - config fallback)" % fmt(limit)
     lines = [
         "<b>session</b>: %s · <code>%s</code>"
         % (_esc(str(name)), _esc(str(meta.get("session_id") or "?"))),
         "<b>model</b>: <code>%s</code>" % _esc(model),
-        "<b>context</b>: %s / %s chars (%d%%) · %d messages"
-        % ("{:,}".format(chars), "{:,}".format(limit), pct, len(history)),
+        context_line,
         "auto-compact: <b>%s</b>" % (
             "would trigger now" if would_compact
-            else "not yet (triggers over %s chars)" % "{:,}".format(limit)),
+            else "not yet - triggers at " + at),
         "<b>tokens</b>: in %s · out %s · cached read %s · cached write %s"
         % tuple("{:,}".format(int(meta.get(k) or 0)) for k in
                 ("tokens_in", "tokens_out", "tokens_cached_read",
@@ -1248,8 +1300,9 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     history = state.get_history(chat_id, thread_id)
     history.append(user_msg)
 
-    # auto-compact before the context limit is hit
-    if not stop() and _est_chars(history) > cfg.context_limit_chars and len(history) > 6:
+    # auto-compact at the threshold (default: 100% of the model's window)
+    if not stop() and _est_chars(history) > _compact_limit_chars(cfg, model_full) \
+            and len(history) > 6:
         before = len(history)
         cusage = {}
         try:

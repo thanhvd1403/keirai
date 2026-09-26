@@ -38,6 +38,9 @@ class Config:
         self.rich_messages = bool(data.get("rich_messages", True))
         self.stream_drafts = bool(data.get("stream_drafts", True))
         self.context_limit_chars = int(data.get("context_limit_chars", 120_000))
+        # explicit only when the user actually set it in config.toml - the
+        # default threshold is 100% of the model's context window (models.dev)
+        self.context_limit_explicit = "context_limit_chars" in data
         self.default_model = data.get("default_model", "go/mimo-v2.6-flash")
         self.topic_flow = bool(data.get("topic_flow", False))
         self.max_file_mb = int(data.get("max_file_mb", 20))

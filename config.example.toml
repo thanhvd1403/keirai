@@ -11,7 +11,7 @@ allowed_users = [42, "someusername"]
 thinking_default = true                  # show AI reasoning by default
 rich_messages = true                     # Bot API 10.1 rich messages (native tables, task lists); auto-falls back to regular messages on error
 stream_drafts = true                      # live streaming via sendRichMessageDraft (private chats); falls back to blocking on error
-context_limit_chars = 120000             # auto-compact a session when its history exceeds this many characters
+# context_limit_chars = 120000             # optional override: auto-compact threshold in chars (default = 100% of the model's context window from models.dev)
 
 # ---- agent tools (P2)
 tools_enabled = true                     # master switch for LLM tools (files/shell/web/browser)

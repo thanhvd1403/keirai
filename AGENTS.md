@@ -57,7 +57,7 @@ Run tests: `python -m unittest discover -s tests`
 
 ## Current Status
 
-P0 + P1 + P2 + P3 + P4 complete and tested (215 tests). The bot does:
+P0 + P1 + P2 + P3 + P4 complete and tested (220 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
@@ -65,7 +65,7 @@ P0 + P1 + P2 + P3 + P4 complete and tested (215 tests). The bot does:
 - AI answers sent as Bot API 10.1 Rich Messages: markdown passthrough (native tables, task lists, headings, formulas, 32k chars), thinking as collapsible `<details>`; `rich_messages` config toggle + automatic fallback to regular messages
 - Live streaming in private chats via `sendRichMessageDraft` (reasoning as `<tg-thinking>`, then answer tokens; `stream_drafts` toggle, falls back to blocking)
 - Session persistence in SQLite (`sessions.db`): history, per-session model, topic registry - survives restarts; `/delete` clears one session's context
-- Context window management: `context_limit_chars` limit, `/compact` manual + auto-compact (summarize older messages, keep last 4)
+- Context window management: `/context` shows used/max against the model's **real context window** (models.dev tokens, chars shown too); auto-compact fires at **100% of that window** by default (`context_limit_chars` in config.toml overrides); `/compact` manual (summarize older messages, keep last 4)
 - CLI: `python cli.py list|delete|rename` for session admin without Telegram
 - Agent tools (OpenAI function-calling, `tools.py`): `read_file`/`write_file`/`edit_file`, `bash` (destructive-command blacklist, agent-settable 1-300s timeout, long output saved to `logs/bash-out-*.txt`), `web_search`/`web_fetch` (Parallel Search MCP - free, no key), optional `browse` (Lightpanda, install via `deploy/install_lightpanda.sh` -> `./tools/lightpanda`)
 - Tool rounds run in-turn **uncapped** (until the model stops asking for tools; `/stop` interrupts a runaway turn) and are not persisted - only the final answer lands in history; every turn logs `tool round N: X call(s)` and `turn done: ... tool_rounds=...`
@@ -77,7 +77,7 @@ P0 + P1 + P2 + P3 + P4 complete and tested (215 tests). The bot does:
 - `/models` lists models with context/cost stats from **models.dev** (OpenCode's own catalog, daily sync to `cache/models_meta.json`); `/model provider/id` switches models
 - **Go-first inference**: default model `go/mimo-v2.6-flash`; on a provider error the call retries once on the other provider when it has a key AND its catalog serves the model
 - **Usage accounting**: every call's `usage` (blocking + streaming via `stream_options.include_usage`) is accumulated per session in `sessions.db` (`session_meta`: session id `yyyymmdd-hhmm-4hex`, tokens in/out/cached read/cached write, notional cost with cached-read discount)
-- `/context` shows context usage (chars vs limit, auto-compact trigger, session name/id/model, token totals); `/cost` adds the session's notional total cost
+- `/context` shows context usage as `~used / max tokens` (max = model window from models.dev; chars + message count too), the auto-compact threshold on its own line, session name/id/model, token totals; `/cost` adds the session's notional total cost
 - **Topic flow** (switchable via `/topic`, flag persisted in `config.toml`): entering requires Threaded mode ON **and** "Disallow users to create topics" ON (both checked live via getMe, typed yes/no confirmation); while ON, All accepts commands only (session-scoped ones rejected with a hint, `/model global` allowed) and every message in a topic needs a bound session - unbound topics get a rejection hint
 - `/session [page N | N | <id>]`: lists sessions (name, id, timestamp, last-message preview - last-active first, current session excluded), switches them; in topic flow switching goes through typed per-slot prompts (switch-here / create-new / ping / do-nothing), with dead-topic ping recovery (`400 message thread not found` -> auto new topic)
 - Sessions move between **slots** (`thread_id` >0 = bound to that topic, main chat = None, negative = parked/unbound); `/new` creates a topic+bound session in topic flow, or parks the old session and starts blank in normal flow

@@ -85,6 +85,8 @@ def make_config(**kw):
     import config as config_mod
     base = {"bot_token": "t", "allowed_users": [42],
             "rich_messages": True, "stream_drafts": False,
+            # explicit -> default tests never hit models.dev for thresholds
+            "context_limit_chars": 120_000,
             "providers": {"zen": {"api_key": "zk"}, "go": {"api_key": "gk"}}}
     base.update(kw)
     return config_mod.Config(base)
@@ -516,6 +518,59 @@ class TestCompact(unittest.TestCase):
         self.assertIn("[Summary of earlier conversation]", hist[0]["content"])
         self.assertEqual(hist[-1]["content"], "final answer")
         self.assertEqual(chat_mock.call_count, 2)
+
+
+    @mock.patch.object(providers, "price_for")
+    @mock.patch.object(providers, "chat")
+    def test_auto_compact_fires_at_full_window(self, chat_mock, price_mock):
+        """Integration: history past the model's window (default threshold =
+        100%) triggers compaction without any explicit config."""
+        price_mock.return_value = {"context": 300}  # 300 tokens = 1,200 chars
+        cfg = make_config()
+        cfg.context_limit_explicit = False  # as if the key is absent
+        chat_mock.side_effect = [("SUMMARY", "", None),
+                                 ("final answer", "", None)]
+        hist = self.state.get_history(100, None)
+        for i in range(8):
+            hist.append({"role": "user" if i % 2 == 0 else "assistant",
+                         "content": "msg %d " % i + "z" * 300})
+        main.handle_message(cfg, self.tg, msg(text="continue"), self.state)
+        hist = self.state.get_history(100, None)
+        self.assertIn("[Summary of earlier conversation]", hist[0]["content"])
+        self.assertEqual(hist[-1]["content"], "final answer")
+        self.assertEqual(chat_mock.call_count, 2)
+
+
+class TestCompactThreshold(unittest.TestCase):
+    """Auto-compact threshold: 100% of the model window by default;
+    explicit context_limit_chars overrides; missing metadata falls back."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        disable_titles(self)
+
+    @mock.patch.object(providers, "price_for")
+    def test_default_is_full_model_window(self, price_mock):
+        price_mock.return_value = {"context": 1048576}
+        cfg = make_config()
+        cfg.context_limit_explicit = False  # as if the key is absent
+        self.assertEqual(main._compact_limit_chars(cfg, "go/mimo-v2.6-flash"),
+                         1048576 * main.CHARS_PER_TOKEN)
+
+    @mock.patch.object(providers, "price_for")
+    def test_explicit_config_value_wins(self, price_mock):
+        cfg = make_config(context_limit_chars=100)
+        self.assertEqual(main._compact_limit_chars(cfg, "go/mimo-v2.6-flash"),
+                         100)
+        price_mock.assert_not_called()
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    def test_no_metadata_falls_back_to_config(self, price_mock):
+        cfg = make_config()
+        cfg.context_limit_explicit = False
+        self.assertEqual(main._compact_limit_chars(cfg, "go/unknown-model"),
+                         120_000)
 
 
 class TestStreaming(unittest.TestCase):
@@ -1013,8 +1068,10 @@ class TestContextCostCommands(unittest.TestCase):
         self.cfg = make_config()
         disable_titles(self)
 
+    @mock.patch.object(providers, "price_for")
     @mock.patch.object(providers, "chat", return_value=("a", "", None))
-    def test_context_shows_usage_without_cost(self, _):
+    def test_context_shows_usage_without_cost(self, _, price_mock):
+        price_mock.return_value = {"context": 1048576}
         main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
         self.tg.sent.clear()
         main.handle_message(self.cfg, self.tg, msg(text="/context"), self.state)
@@ -1022,18 +1079,30 @@ class TestContextCostCommands(unittest.TestCase):
         self.assertIn("<b>session</b>", text)
         self.assertIn("<b>model</b>", text)
         self.assertIn("<b>context</b>", text)
+        # used/max against the model's REAL window (models.dev, tokens)
+        self.assertIn("/ 1,048,576 tokens", text)
+        self.assertIn("chars", text)
         self.assertIn("<b>tokens</b>", text)
         self.assertIn("auto-compact:", text)
         self.assertNotIn("<b>cost</b>", text)
         self.assertRegex(text, r"\d{8}-\d{4}-[0-9a-f]{4}")
 
-    def test_cost_adds_cost_line_and_context_block(self):
+    @mock.patch.object(providers, "price_for",
+                       return_value={"context": 500000})
+    def test_cost_adds_cost_line_and_context_block(self, _):
         main.handle_message(self.cfg, self.tg, msg(text="/cost"), self.state)
         text = self.tg.sent[-1][1]
         self.assertIn("<b>cost</b>: $", text)
         self.assertIn("<b>tokens</b>", text)
         self.assertIn("<b>context</b>", text)
+        self.assertIn("/ 500,000 tokens", text)  # model window, not config
         self.assertIn("<b>model</b>", text)
+        self.assertIn("triggers at", text)  # threshold lives on its own line
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    def test_context_max_unknown_without_metadata(self, _):
+        main.handle_message(self.cfg, self.tg, msg(text="/context"), self.state)
+        self.assertIn("max unknown", self.tg.sent[-1][1])
 
 
 class TestModelsStats(unittest.TestCase):
