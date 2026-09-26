@@ -18,7 +18,8 @@ import browser
 import config as config_mod
 import websearch
 
-MAX_ROUNDS = 6        # max tool-call rounds per user turn
+# No round cap (user directive): tool rounds continue until the model stops
+# asking for tools. /stop interrupts a runaway turn at any round.
 RESULT_CAP = 40_000   # chars of tool output fed back to the model
 OUTPUT_CAP = 40_000   # bash output kept inline; beyond -> file
 READ_CAP = 200_000    # read_file hard cap

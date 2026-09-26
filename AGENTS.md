@@ -57,7 +57,7 @@ Run tests: `python -m unittest discover -s tests`
 
 ## Current Status
 
-P0 + P1 + P2 + P3 + P4 complete and tested (213 tests). The bot does:
+P0 + P1 + P2 + P3 + P4 complete and tested (215 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
@@ -68,7 +68,7 @@ P0 + P1 + P2 + P3 + P4 complete and tested (213 tests). The bot does:
 - Context window management: `context_limit_chars` limit, `/compact` manual + auto-compact (summarize older messages, keep last 4)
 - CLI: `python cli.py list|delete|rename` for session admin without Telegram
 - Agent tools (OpenAI function-calling, `tools.py`): `read_file`/`write_file`/`edit_file`, `bash` (destructive-command blacklist, agent-settable 1-300s timeout, long output saved to `logs/bash-out-*.txt`), `web_search`/`web_fetch` (Parallel Search MCP - free, no key), optional `browse` (Lightpanda, install via `deploy/install_lightpanda.sh` -> `./tools/lightpanda`)
-- Tool rounds run in-turn (max 6 rounds) and are not persisted - only the final answer lands in history
+- Tool rounds run in-turn **uncapped** (until the model stops asking for tools; `/stop` interrupts a runaway turn) and are not persisted - only the final answer lands in history; every turn logs `tool round N: X call(s)` and `turn done: ... tool_rounds=...`
 - `/stop` interrupts a running reply/tool: an update-watcher thread owns getUpdates, intercepts /stop mid-turn, kills running `bash`, and records a neutral "[This run was interrupted by the user...]" marker in context
 - Reply-to/quote context: replies and quoted parts are injected into the prompt as annotations (item 17)
 - Dynamic `/help` built from the command registry; commands registered with `setMyCommands`; anonymized app-wide session header (`x-opencode-session: keirai` - no chat ids leave the machine) + `keirai/0.1` user agent
@@ -81,7 +81,7 @@ P0 + P1 + P2 + P3 + P4 complete and tested (213 tests). The bot does:
 - **Topic flow** (switchable via `/topic`, flag persisted in `config.toml`): entering requires Threaded mode ON **and** "Disallow users to create topics" ON (both checked live via getMe, typed yes/no confirmation); while ON, All accepts commands only (session-scoped ones rejected with a hint, `/model global` allowed) and every message in a topic needs a bound session - unbound topics get a rejection hint
 - `/session [page N | N | <id>]`: lists sessions (name, id, timestamp, last-message preview - last-active first, current session excluded), switches them; in topic flow switching goes through typed per-slot prompts (switch-here / create-new / ping / do-nothing), with dead-topic ping recovery (`400 message thread not found` -> auto new topic)
 - Sessions move between **slots** (`thread_id` >0 = bound to that topic, main chat = None, negative = parked/unbound); `/new` creates a topic+bound session in topic flow, or parks the old session and starts blank in normal flow
-- **Agent titles**: after a session's first message one extra completion (default model) names it (media-only messages named from the media when vision-capable); `/rename` mirrors session+topic; `/model global <id>` writes the default to `config.toml` (comments preserved)
+- **Agent titles**: after a session's first message one extra completion (default model) names it, prompted for a **3-4 word Title Case title** (no mechanical cap; light cleanup only - `Title:` marker/quotes/punctuation stripped); media-only messages named from the media when vision-capable; `/rename` mirrors session+topic; `/model global <id>` writes the default to `config.toml` (comments preserved)
 - Photos -> vision models; media round-trip test via caption `media_test`
 - Logging: stderr + `logs/keirai.log` (rotating)
 

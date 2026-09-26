@@ -55,6 +55,7 @@ class State:
         self.page = {}       # (chat_id, slot) -> current /session page
         self.updated = {}    # (chat_id, slot) -> last-active timestamp
         self.allows_user_topics = False  # getMe: "Disallow users to create topics"
+        self.bot_id = None  # our own id - Telegram echoes back our own events
         self._turn_lock = threading.Lock()
         self.active_turns = {}   # chat_key -> True while a reply/tool turn runs
         self.interrupts = set()  # chat_keys the user asked to /stop
@@ -997,6 +998,20 @@ def _record_usage(cfg, state, chat_id, thread_id, usage, provider, model_id):
     })
 
 
+def _clean_title(raw):
+    """Light hygiene for the model's own title: drop a TITLE: marker and
+    stray quotes/punctuation. Word count is the prompt's job (group 19) -
+    no mechanical cap."""
+    t = (raw or "").strip()
+    if not t:
+        return ""
+    if t.lower().startswith("title:"):
+        t = t[6:].strip()
+    t = " ".join(t.split())
+    t = t.strip("\"'“”‘’*`").strip()
+    return t.strip(" ,.;:!?-–—")[:60].strip(" ,.;:!?-–—")
+
+
 def _maybe_name_session(cfg, tg, state, chat_id, thread_id, text, images):
     """Group 19: one extra completion after a session's first message yields
     a very short title (session name; topic renamed to match). Uses the
@@ -1040,10 +1055,9 @@ def _maybe_name_session(cfg, tg, state, chat_id, thread_id, text, images):
         out, _r, _t = providers.chat(
             provider, api_key, model_id,
             [{"role": "system",
-              "content": "Reply with ONLY a very short name for this new "
-                         "conversation: at most 4 words, no quotes, no "
-                         "punctuation, no markdown. It will be used as a "
-                         "session/topic title."},
+              "content": "Reply with ONLY the title of this new conversation: "
+                         "three or four words in Title Case naming its topic. "
+                         "No sentence, no quotes, no markdown, nothing else."},
              {"role": "user", "content": content}],
             session_id=SESSION_ID, usage_out=usage)
     except Exception as e:
@@ -1051,7 +1065,7 @@ def _maybe_name_session(cfg, tg, state, chat_id, thread_id, text, images):
         return
     _record_usage(cfg, state, chat_id, thread_id, usage, provider, model_id)
     first = (out or "").strip().splitlines()[0] if (out or "").strip() else ""
-    title = first.strip().strip("\"'“”‘’*").strip()[:60]
+    title = _clean_title(first)
     if not title:
         return
     meta["name"] = title
@@ -1259,7 +1273,8 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
 
     reasoning, answer = None, None
     interrupted = False
-    for rnd in range(tools_mod.MAX_ROUNDS + 1):
+    rounds = 0
+    while True:  # unbounded: runs until the model stops calling tools
         if stop():
             interrupted = True
             break
@@ -1288,8 +1303,10 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         if stop():
             interrupted = True
             break
-        if not tcs or rnd >= tools_mod.MAX_ROUNDS:
-            break
+        if not tcs:
+            break  # the model produced its final text
+        rounds += 1
+        log.info("tool round %d: %d call(s)", rounds, len(tcs))
         # run the tools the model asked for
         messages.append({"role": "assistant", "content": answer or "",
                          "tool_calls": [
@@ -1324,7 +1341,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         return
 
     if not (answer or "").strip():
-        # round cap hit (or empty answer): final call, tools off
+        # no text and no tool calls either: one retry with tools off
         tg.typing(chat_id, thread_id)
         try:
             answer, reasoning, _ = pcall(messages)
@@ -1333,6 +1350,13 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             state.persist(chat_id, thread_id)
             _err(tg, msg, thread_id, "%s error: %s" % (provider_name, e))
             return
+
+    if "<function=" in (answer or "") or "<function:" in (answer or ""):
+        log.warning("answer contains text-form tool calls (model bypassed the "
+                    "tools API) - delivering as text: chat=%s thread=%s",
+                    chat_id, thread_id)
+    log.info("turn done: chat=%s thread=%s tool_rounds=%d answer=%d chars",
+             chat_id, thread_id, rounds, len(answer or ""))
 
     history.append({"role": "assistant", "content": answer})
     del history[:-HISTORY_LIMIT]
@@ -1551,10 +1575,41 @@ def _dispatch_command(cfg, tg, msg, text, thread_id, state):
         entry[0](cfg, tg, msg, thread_id, state)
 
 
+def _witness_topic_event(chat_id, thread_id, msg, state):
+    """Record topic lifecycle events in the registry (for /reset-all and
+    name mirroring). No-op for any other kind of message."""
+    if not thread_id:
+        return
+    created = msg.get("forum_topic_created")
+    if isinstance(created, dict):
+        name = created.get("name") or ""
+        if thread_id not in state.topics.setdefault(chat_id, []):
+            state.topics[chat_id].append(thread_id)
+        state.topic_names[(chat_id, thread_id)] = name
+        if state.store:
+            state.store.add_topic(chat_id, thread_id, name)
+        return
+    edited = msg.get("forum_topic_edited")
+    if isinstance(edited, dict) and edited.get("name"):
+        state.topic_names[(chat_id, thread_id)] = edited["name"]
+        if state.store:
+            state.store.set_topic_name(chat_id, thread_id, edited["name"])
+
+
 def handle_message(cfg, tg, msg, state):
     chat_id = msg["chat"]["id"]
     thread_id = msg.get("message_thread_id")
     user = msg.get("from") or {}
+
+    # Telegram echoes back events the bot itself caused (topic created/
+    # edited service messages, its own replies): witness the topic events,
+    # never treat them as a user message or an allow-list miss.
+    if state.bot_id is not None and user.get("id") == state.bot_id:
+        _witness_topic_event(chat_id, thread_id, msg, state)
+        log.info("bot's own message/event - ignored: chat=%s thread=%s",
+                 chat_id, thread_id)
+        return
+
     if not cfg.is_allowed(user.get("id"), user.get("username")):
         log.info("ignored message from user %s (@%s) - not in allowed_users",
                  user.get("id"), user.get("username"))
@@ -1562,15 +1617,9 @@ def handle_message(cfg, tg, msg, state):
     log.info("message from user %s (@%s) chat=%s thread=%s",
              user.get("id"), user.get("username"), chat_id, thread_id)
 
-    # topic lifecycle: witness creations into the registry, never hinted
-    if "forum_topic_created" in msg:
-        created = msg.get("forum_topic_created") or {}
-        if thread_id:
-            if thread_id not in state.topics.setdefault(chat_id, []):
-                state.topics[chat_id].append(thread_id)
-            state.topic_names[(chat_id, thread_id)] = created.get("name") or ""
-            if state.store:
-                state.store.add_topic(chat_id, thread_id, created.get("name"))
+    # topic lifecycle: witness creations/renames, never hinted
+    if "forum_topic_created" in msg or "forum_topic_edited" in msg:
+        _witness_topic_event(chat_id, thread_id, msg, state)
         return
     if any(k in msg for k in TOPIC_SERVICE_EVENTS):
         return
@@ -1745,6 +1794,7 @@ def main():
         me = tg.get_me()
         state.topics_enabled = bool(me.get("has_topics_enabled"))
         state.allows_user_topics = bool(me.get("allows_users_to_create_topics"))
+        state.bot_id = me.get("id")
         log.info("bot @%s ready (private-chat topics: %s, disallow-user-topics: %s)",
                  me.get("username", "?"),
                  "on" if state.topics_enabled else

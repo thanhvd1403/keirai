@@ -799,15 +799,21 @@ class TestToolLoop(unittest.TestCase):
         self.assertIsNone(chat_mock.call_args[1]["tools"])
 
     @mock.patch.object(providers, "chat")
-    def test_round_cap_forces_plain_answer(self, chat_mock):
-        """Model that never stops calling tools still gets a final answer."""
-        tc = [{"id": "c1", "name": "read_file", "arguments": {"path": "notes.txt"}}]
-        side = [("", "", tc) for _ in range(main.tools_mod.MAX_ROUNDS + 1)]
-        side.append(("capped answer", "", None))
-        chat_mock.side_effect = side
+    def test_tool_rounds_run_without_cap(self, chat_mock):
+        """No round cap (user directive): tool rounds continue until the model
+        stops asking for tools - the old cap's tools-off final call is what
+        produced text-form tool calls in chat."""
+        tc = [{"id": "c1", "name": "read_file", "arguments": {"path": "missing.txt"}}]
+        rounds = 9  # well past the old 6-round cap
+        chat_mock.side_effect = [("", "", tc) for _ in range(rounds)] + \
+            [("final answer", "", None)]
         main.handle_message(self.cfg, self.tg, msg(text="loop me"), self.state)
-        self.assertEqual(self.tg.rich[-1][1], {"markdown": "capped answer"})
-        self.assertEqual(chat_mock.call_count, main.tools_mod.MAX_ROUNDS + 2)
+        self.assertEqual(self.tg.rich[-1][1], {"markdown": "final answer"})
+        self.assertEqual(chat_mock.call_count, rounds + 1)
+        # every round's tool result was fed back into the conversation
+        last = chat_mock.call_args_list[-1][0][3]
+        self.assertEqual(len([m for m in last if m.get("role") == "tool"]),
+                         rounds)
 
 
 class TestReplyTo(unittest.TestCase):
@@ -1238,6 +1244,26 @@ class TestDeliveryRules(unittest.TestCase):
         self.assertEqual(self.state.topic_names[(100, 999)], "client topic")
         self.assertEqual(self.tg.sent, [])  # service messages never hinted
 
+    @mock.patch.object(providers, "chat")
+    def test_bots_own_events_witnessed_not_allowed_list_miss(self, chat_mock):
+        """Telegram echoes back events the bot itself caused (log showed them
+        as 'not in allowed_users'): they must be witnessed quietly instead."""
+        self.state.bot_id = 8887915792
+        m = msg(text="", message_thread_id=7654)
+        m["from"] = {"id": 8887915792, "username": "vdt_keirai_bot"}
+        m["forum_topic_created"] = {"name": "bot topic"}
+        main.handle_message(self.cfg, self.tg, m, self.state)
+        self.assertIn(7654, self.state.topics[100])
+        self.assertEqual(self.state.topic_names[(100, 7654)], "bot topic")
+        self.assertEqual(self.tg.sent, [])            # no reply, no hint
+        chat_mock.assert_not_called()
+        # the bot's own plain message: quiet no-op, never treated as a user
+        m2 = msg(text="my own reply")
+        m2["from"] = {"id": 8887915792, "username": "vdt_keirai_bot"}
+        main.handle_message(self.cfg, self.tg, m2, self.state)
+        self.assertEqual(self.tg.sent, [])
+        chat_mock.assert_not_called()
+
 
 class TestSessionCommands(unittest.TestCase):
     """P4 group 22: /session listing, switching matrix, prompts, ping."""
@@ -1452,13 +1478,13 @@ class TestSessionTitles(unittest.TestCase):
         main.handle_message(self.cfg, self.tg, msg(text="plan my trip"),
                             self.state)
         m = self.state.meta[(100, None)]
-        self.assertEqual(m["name"], "Trip Planning!")
+        self.assertEqual(m["name"], "Trip Planning")  # punctuation stripped
         self.assertEqual(chat_mock.call_count, 2)
         # second turn: no more naming calls
         main.handle_message(self.cfg, self.tg, msg(text="and hotels"),
                             self.state)
         self.assertEqual(chat_mock.call_count, 3)
-        self.assertEqual(self.state.meta[(100, None)]["name"], "Trip Planning!")
+        self.assertEqual(self.state.meta[(100, None)]["name"], "Trip Planning")
 
     @mock.patch.object(providers, "price_for", return_value=None)
     @mock.patch.object(providers, "chat")
@@ -1508,6 +1534,19 @@ class TestSessionTitles(unittest.TestCase):
         self.assertTrue(any(p.get("type") == "image_url"
                             for p in naming_content))
         self.assertEqual(self.state.meta[(100, None)]["name"], "Nice Pic")
+
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_title_marker_and_quotes_stripped(self, chat_mock, price_mock):
+        """Light hygiene only - word choice is left to the prompt."""
+        chat_mock.side_effect = [
+            ("answer", "", None),
+            ("Title: \"Docker Networking\"", "", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="help me deploy"),
+                            self.state)
+        self.assertEqual(self.state.meta[(100, None)]["name"],
+                         "Docker Networking")
 
 
 class TestConfigPersistence(unittest.TestCase):
