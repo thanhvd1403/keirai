@@ -85,7 +85,7 @@ P0 + P1 + P2 + P3 + P4 complete and tested (230 tests). The bot does:
 - Photos -> vision models; media round-trip test via caption `media_test`
 - Logging: stderr + `logs/keirai.log` (rotating)
 
-Not implemented yet: P5 (custom OpenAI-compatible providers, interactive setup script) - see TODO.md. Topic flow is unit-tested; the live walkthrough on the dev/production bot is still pending.
+Not implemented yet: P5 (custom OpenAI-compatible providers, interactive setup script, then the question tool) - see TODO.md. Topic flow is unit-tested; the live walkthrough on the dev/production bot is still pending.
 
 ## External Components & Licenses
 

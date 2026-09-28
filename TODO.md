@@ -5,7 +5,7 @@
 > into implementable phases:
 > - **P3** - provider foundation: usage capture, models.dev metadata, Go-first priority, `/context` + `/cost`
 > - **P4** - topic flow & session UX: `/topic` mode, `/session`, delivery rules, titles
-> - **P5** - custom OpenAI-compatible providers + setup wizard (last)
+> - **P5** - custom OpenAI-compatible providers + setup wizard, then the question tool (last)
 
 ## P0 - Telegram Bot with Markdown & Reasoning Display (complete)
 
@@ -303,11 +303,12 @@
 - [x] Persist the mode flag back to config.toml (as at entry)
 - [x] After the switch: all bot messages are sent **without** a thread ID; **EVERY message that lands inside a topic is ignored - plain messages AND commands alike - and answered with a hint EVERY time** (topics are fully inert while flow is off; session recovery then works via `/session` from All only - `/session` from a topic applies while topic flow is ON)
 
-## P5 - Custom OpenAI-Compatible Providers (last)
+## P5 - Custom Providers, Setup Script & Question Tool (last)
 
 **Implementation points:**
 1. [ ] Custom provider config + `/models` integration (group 23), using the group 25 metadata pipeline for stats where available
 2. [ ] Interactive `setup.py` wizard (group 24)
+3. [ ] Question tool with inline-button answers (group 26)
 
 ### 23. Custom providers
 - [ ] Support custom OpenAI-compatible providers via config (base URL + API key)
@@ -325,3 +326,13 @@
   - Detect systemd; if present, offer to install the unit with correct User/paths, then `daemon-reload` + `enable --now`
   - Skip gracefully (with a printed hint) when systemd is unavailable
 - [ ] Rerunnable: detect existing config and offer to edit values instead of overwriting
+
+### 26. Interactive question tool (inline buttons)
+- [ ] New agent tool (e.g. `ask_user`) the model calls when it needs the user to decide something
+  - Sends the question with **inline keyboard buttons**, one per option (`reply_markup: inline_keyboard`)
+  - Tapping a button answers: the chosen option is returned to the model as the tool result and the turn continues
+  - Last button always **"Write my own answer"**: tapping it makes the script **wait for the user's next message** - that message text becomes the tool result
+- [ ] Introduces `callback_query` handling - new territory: group 22 prompts are typed replies by decision, no inline keyboards
+- [ ] One answer per question: edit the buttons off after answering; a second tap is ignored
+- [ ] Pending question is per session (same slot idea as the typed prompts); a command or a new plain message while a question is pending = cancel + handle normally (mirror group 22 rules)
+- [ ] Open: does the tool block the turn until an answer arrives, and does it wait forever (like typed prompts) or expire after a timeout?
