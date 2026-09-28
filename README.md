@@ -22,15 +22,15 @@ pages.
 
 > *A small note from the human:*
 > 
-> *- Why I bult this: I had a 1GB server lying around and it wouldn't run other harnesses without issues. So I built one for myself to use.*
+> *- Why I built this: I had a 1GB server lying around and it wouldn't run other harnesses without issues. So I built one for myself to use.*
 > 
-> *- This is 100% AI code. Feel free to call it AI slop if you will.*
+> *- This is 100% AI code. I don't have much experience doing software development apart from uni projects. Take every piece of code here with a grain of salt. Feel free to call it AI slop if you will.*
 
 ## Requirements
 
 - Python 3.11+
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- An [opencode.ai](https://opencode.ai) API key (Zen and/or Go)
+- **IMPORTANT**: An [opencode.ai](https://opencode.ai) API key (Zen and/or Go) (support for other providers to be added, soon)
 - (Optional) [Lightpanda](https://lightpanda.io) for the `browse` tool
 
 ## Setup
