@@ -57,7 +57,7 @@ Run tests: `python -m unittest discover -s tests`
 
 ## Current Status
 
-P0 + P1 + P2 + P3 + P4 complete and tested (220 tests). The bot does:
+P0 + P1 + P2 + P3 + P4 complete and tested (230 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
@@ -68,7 +68,7 @@ P0 + P1 + P2 + P3 + P4 complete and tested (220 tests). The bot does:
 - Context window management: `/context` shows used/max against the model's **real context window** (models.dev tokens, chars shown too); auto-compact fires at **100% of that window** by default (`context_limit_chars` in config.toml overrides); `/compact` manual (summarize older messages, keep last 4)
 - CLI: `python cli.py list|delete|rename` for session admin without Telegram
 - Agent tools (OpenAI function-calling, `tools.py`): `read_file`/`write_file`/`edit_file`, `bash` (destructive-command blacklist, agent-settable 1-300s timeout, long output saved to `logs/bash-out-*.txt`), `web_search`/`web_fetch` (Parallel Search MCP - free, no key), optional `browse` (Lightpanda, install via `deploy/install_lightpanda.sh` -> `./tools/lightpanda`)
-- Tool rounds run in-turn **uncapped** (until the model stops asking for tools; `/stop` interrupts a runaway turn) and are not persisted - only the final answer lands in history; every turn logs `tool round N: X call(s)` and `turn done: ... tool_rounds=...`
+- Tool rounds run in-turn **uncapped** (`/stop` interrupts a runaway turn); only the final answer lands in history; each turn logs `tool round N: X call(s)` and `turn done: ... tool_rounds=...`
 - `/stop` interrupts a running reply/tool: an update-watcher thread owns getUpdates, intercepts /stop mid-turn, kills running `bash`, and records a neutral "[This run was interrupted by the user...]" marker in context
 - Reply-to/quote context: replies and quoted parts are injected into the prompt as annotations (item 17)
 - Dynamic `/help` built from the command registry; commands registered with `setMyCommands`; anonymized app-wide session header (`x-opencode-session: keirai` - no chat ids leave the machine) + `keirai/0.1` user agent
@@ -76,12 +76,12 @@ P0 + P1 + P2 + P3 + P4 complete and tested (220 tests). The bot does:
 - `/test_md` (regular pipeline) and `/test_rich` (rich pipeline) for live rendering verification
 - `/models` lists models with context/cost stats from **models.dev** (OpenCode's own catalog, daily sync to `cache/models_meta.json`); `/model provider/id` switches models
 - **Go-first inference**: default model `go/mimo-v2.6-flash`; on a provider error the call retries once on the other provider when it has a key AND its catalog serves the model
-- **Usage accounting**: every call's `usage` (blocking + streaming via `stream_options.include_usage`) is accumulated per session in `sessions.db` (`session_meta`: session id `yyyymmdd-hhmm-4hex`, tokens in/out/cached read/cached write, notional cost with cached-read discount)
-- `/context` shows context usage as `~used / max tokens` (max = model window from models.dev; chars + message count too), the auto-compact threshold on its own line, session name/id/model, token totals; `/cost` adds the session's notional total cost
-- **Topic flow** (switchable via `/topic`, flag persisted in `config.toml`): entering requires Threaded mode ON **and** "Disallow users to create topics" ON (both checked live via getMe, typed yes/no confirmation); while ON, All accepts commands only (session-scoped ones rejected with a hint, `/model global` allowed) and every message in a topic needs a bound session - unbound topics get a rejection hint
-- `/session [page N | N | <id>]`: lists sessions (name, id, timestamp, last-message preview - last-active first, current session excluded), switches them; in topic flow switching goes through typed per-slot prompts (switch-here / create-new / ping / do-nothing), with dead-topic ping recovery (`400 message thread not found` -> auto new topic)
+- **Usage accounting**: each call's `usage` (blocking + streaming) accumulates per session in `sessions.db` (`session_meta`: id `yyyymmdd-hhmm-4hex`, tokens in/out/cached, notional cost with cached-read discount)
+- `/context` and `/cost` add session name/id/model, token totals (in/out/cached) - `/cost` also shows the session's notional cost
+- **Topic flow** (`/topic`, persisted in `config.toml`): entry needs Threaded mode ON **and** "Disallow users to create topics" ON (checked live via getMe, typed confirmation); while ON, All takes commands only (session-scoped rejected with a hint, `/model global` allowed) and every topic message needs a bound session (unbound -> rejection hint)
+- `/session [page N | N | <id>]`: lists sessions (name/id/timestamp/preview, last-active first, current excluded) and switches them; topic-flow switches go through typed per-slot prompts (switch-here / create-new / ping / do-nothing) with dead-topic ping recovery
 - Sessions move between **slots** (`thread_id` >0 = bound to that topic, main chat = None, negative = parked/unbound); `/new` creates a topic+bound session in topic flow, or parks the old session and starts blank in normal flow
-- **Agent titles**: after a session's first message one extra completion (default model) names it, prompted for a **3-4 word Title Case title** (no mechanical cap; light cleanup only - `Title:` marker/quotes/punctuation stripped); media-only messages named from the media when vision-capable; `/rename` mirrors session+topic; `/model global <id>` writes the default to `config.toml` (comments preserved)
+- **Agent titles**: the model title is generated *concurrently with the reply* (JSON-constrained call, OpenCode-style prompt) and applied after delivery - **one rename per session, no retries**; on timeout/fault a derived fallback (first line ~48 chars, media placeholder) sticks; faulty output (tool-call text, >12-word answers) is rejected, never truncated; provenance `derived < llm < user`; media-only messages named from the media; `/rename` mirrors session+topic
 - Photos -> vision models; media round-trip test via caption `media_test`
 - Logging: stderr + `logs/keirai.log` (rotating)
 

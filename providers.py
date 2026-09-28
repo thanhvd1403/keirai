@@ -328,6 +328,33 @@ def parse_tool_calls(raw):
     return out or None
 
 
+# Session-title call: a single constrained field, with headroom for a fenced
+# or reasoning reply - a model that honours the contract stops after ~15
+# tokens, so the ceiling only costs on replies that were garbage anyway.
+TITLE_MAX_TOKENS = 512
+TITLE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "session_title",
+        "strict": True,
+        "schema": {"type": "object",
+                   "properties": {"title": {"type": "string"}},
+                   "required": ["title"],
+                   "additionalProperties": False},
+    },
+}
+
+
+def chat_title(name, api_key, model, messages, session_id=None, usage_out=None):
+    """Session-title completion: JSON-constrained output. Providers that
+    ignore response_format degrade to plain text - the caller extracts and
+    validates either way (strict JSON -> loose scan -> prose first line)."""
+    return chat(name, api_key, model, messages, session_id=session_id,
+                usage_out=usage_out,
+                extra={"response_format": TITLE_RESPONSE_FORMAT,
+                       "max_tokens": TITLE_MAX_TOKENS})
+
+
 def chat_stream(name, api_key, model, messages, session_id=None, tools=None,
                 usage_out=None):
     """Streaming chat completion.

@@ -217,11 +217,14 @@
 8. [x] Rewrite the group-9 per-topic isolation tests around flow on/off (213 tests green: mode gates, hints, prompt matrix, ping recovery, titles, config writes) - **unit-tested; live walkthrough with you still pending** (drafts-in-topics + getMe flags already proven live)
 
 ### 19. Agent-generated session titles
-- [x] New sessions get an agent-generated **very short** title (replaces the current "Session N"; `/new <name>` skips generation)
-  - **Mechanism: one extra completion** after the first user message in the session, using **the session's active model - a new session always starts on the default model from config.toml, so use that** (decision)
-  - Applied in **both flows**: normal flow (real names in the `/session` list) and topic flow (the topic is renamed to match - mirrors `/rename`, group 22)
-  - Runs **after** the main reply so first-answer latency is unaffected; on failure keep the placeholder
-  - **Media-only first message**: still named **based on the media** - the naming call includes the media itself when the model is vision-capable, else a type/filename descriptor ("photo", "report.pdf")
+- [x] New sessions get an agent-generated **short** title (replaces "Session N"; `/new <name>` skips generation)
+  - **Single rename**: the call starts with the first user message and runs *concurrently with the reply* in a daemon thread; applied on the main thread after delivery - success = renamed exactly once (model, config default - new sessions start there)
+  - **JSON-constrained** (`response_format: json_schema`, `max_tokens` 512), OpenCode-style prompt with good/vague/too-long examples
+  - **Guards reject, never truncate** (oh-my-pi #7306): tool-call text, >12-word answer-shaped output, prompt-example echoes; no length cap on valid titles
+  - **Fallback**: on timeout/fault the derived title (first line, word-boundary ~48 chars; media placeholder) is applied and sticks - **one attempt per session, no retries**
+  - **Provenance** `derived < llm < user`: `/rename` and `/new <name>` are never overwritten
+  - Both flows; the topic is renamed to match (mirrors `/rename`, group 22)
+  - **Media-only first message**: named from the media - image attached when the model is vision-capable, else a type/filename descriptor
 
 ### 20. Topic-only delivery & All-topic rules
 - [x] All AI messages must be delivered inside a topic - **ignore every message sent to the "All" topic**

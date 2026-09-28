@@ -10,6 +10,7 @@ import logging.handlers
 import mimetypes
 import os
 import queue
+import re
 import secrets
 import string
 import sys
@@ -215,7 +216,10 @@ class State:
         key = self.chat_key(chat_id, thread_id)
         self.history[key] = []
         self.meta[key] = {"session_id": sessions.new_session_id(),
-                          "name": name, "cost_usd": 0.0, "tokens_in": 0,
+                          "name": name,
+                          # provenance: a name from /new <name> is the user's
+                          "name_src": ("user" if name else None),
+                          "cost_usd": 0.0, "tokens_in": 0,
                           "tokens_out": 0, "tokens_cached_read": 0,
                           "tokens_cached_write": 0}
         self.updated[key] = time.time()
@@ -830,6 +834,7 @@ def cmd_rename(cfg, tg, msg, thread_id, state):
         state.topic_names[(chat_id, thread_id)] = name
     meta = state.ensure_meta(chat_id, thread_id)
     meta["name"] = name
+    meta["name_src"] = "user"  # provenance: auto-titling never overwrites
     if state.store:
         state.store.set_session_name(chat_id, thread_id or 0, name)
     where = "topic &amp; session" if thread_id is not None else "session"
@@ -1050,33 +1055,151 @@ def _record_usage(cfg, state, chat_id, thread_id, usage, provider, model_id):
     })
 
 
+# ---------------------------------------------------------------- titles
+# Two-stage titling (group 19), blending OpenCode's title prompt, Hermes'
+# title_generator, oh-my-pi #7306's reject-don't-truncate guard and Pi's
+# cheap background naming:
+#   stage 1 - instant derived title from the user's first line, applied
+#             inline BEFORE the reply (cannot fail, no model call)
+#   stage 2 - model upgrade generated CONCURRENTLY with the reply in a
+#             daemon thread (HTTP only; the main thread applies the result)
+#   provenance derived < llm < user: /rename and /new <name> win forever.
+
+MAX_TITLE_WORDS = 12  # >12 words = the model ANSWERED instead of titling
+_TITLE_EXAMPLES = ("Debugging production 500 errors", "Postgres API connection",
+                   "Python key rotation", "Weekend trip planning")
+_TITLE_ECHO_REJECT = {e.lower() for e in _TITLE_EXAMPLES} | {"code changes"}
+_TITLE_SCAN = re.compile(r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+TITLE_PROMPT = (
+    "You are a title generator for chat sessions. You output ONLY a title. "
+    "You never answer the message and you never use tools.\n"
+    "Rules:\n"
+    "- 3 to 7 words, one line, in the same language as the message.\n"
+    "- Name what the user wants done, not that they asked a question.\n"
+    "- Keep technical terms, filenames, numbers, and error codes exact.\n"
+    "- Drop filler words: the, this, my, a, an.\n"
+    "- No trailing punctuation, no quotes, no tool names, no 'Title:' "
+    "prefix.\n"
+    "Good titles: " + "; ".join(_TITLE_EXAMPLES) + ".\n"
+    'Too vague: "Code changes".\n'
+    'Too long (this answers the message instead of naming it): "Let me '
+    'first check the working directory, then write the test plan".\n'
+    'Reply with JSON only: {"title": "..."}'
+)
+
+
 def _clean_title(raw):
-    """Light hygiene for the model's own title: drop a TITLE: marker and
-    stray quotes/punctuation. Word count is the prompt's job (group 19) -
-    no mechanical cap."""
+    """Light hygiene: drop a Title: marker and stray quotes/punctuation.
+    No length cap - validation rejects answer-shaped output instead of
+    cutting it (oh-my-pi #7306: truncating a blob still leaves a blob)."""
+    t = " ".join((raw or "").split())
+    if t.lower().startswith("title:"):
+        t = t[6:].strip()
+    t = t.strip("\"'“”‘’*`").strip()
+    return t.strip(" ,.;:!?-–—")
+
+
+def _derive_title(text):
+    """Stage 1: the first meaningful line trimmed at a word boundary
+    (~48 chars). Instant, deterministic, no model - it cannot fail."""
+    line = next((ln.strip() for ln in (text or "").splitlines()
+                 if ln.strip()), "")
+    line = " ".join(line.split())
+    if len(line) <= 48:
+        return line
+    cut = line[:48]
+    space = cut.rfind(" ")
+    line = cut[:space] if space > 24 else cut
+    return line.rstrip(" ,.;:!?-–—") + "…"
+
+
+def _media_placeholder(images):
+    if not images:
+        return ""
+    return "Photo" if images[0][0].startswith("image/") else "Attachment"
+
+
+def _json_title(payload):
+    try:
+        obj = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(obj, dict) and isinstance(obj.get("title"), str):
+        return obj["title"].strip()
+    return None
+
+
+def _extract_title(raw):
+    """Model output -> title: fenced body, strict JSON, loose scan, then the
+    first prose line (a provider ignoring response_format still titles). A
+    truncated structured payload is dropped outright - a fragment must never
+    become the title (oh-my-pi #7303)."""
     t = (raw or "").strip()
     if not t:
         return ""
-    if t.lower().startswith("title:"):
-        t = t[6:].strip()
-    t = " ".join(t.split())
-    t = t.strip("\"'“”‘’*`").strip()
-    return t.strip(" ,.;:!?-–—")[:60].strip(" ,.;:!?-–—")
+    body = t
+    if body.startswith("```"):
+        nl = body.find("\n")
+        body = body[nl + 1:].rsplit("```", 1)[0].strip() if nl != -1 else ""
+    title = _json_title(body)
+    if title is None and body != t:
+        title = _json_title(t)
+    if title is None:
+        m = _TITLE_SCAN.search(t)
+        if m:
+            try:
+                title = json.loads('"%s"' % m.group(1))
+            except ValueError:
+                title = m.group(1)
+    if title is not None:
+        return _clean_title(title)
+    if t.startswith(('{"', '["', '[{')) or t.count("```") % 2:
+        return ""  # broken/truncated structured output: never title it
+    first = next((ln for ln in t.splitlines() if ln.strip()), "")
+    return _clean_title(first)
 
 
-def _maybe_name_session(cfg, tg, state, chat_id, thread_id, text, images):
-    """Group 19: one extra completion after a session's first message yields
-    a very short title (session name; topic renamed to match). Uses the
-    config default model (new sessions start there). Media-only first
-    messages are named from the media when the model is vision-capable,
-    else from a type descriptor. Runs after the reply: no first-answer
-    latency; failures keep the placeholder (one attempt per session)."""
+def _title_reject_reason(title):
+    """Why a candidate can't be published ('' = fine). REJECT, never
+    truncate: an answer-shaped blob stays a blob (oh-my-pi #7306, ported by
+    Hermes) - the derived title stays and the next turn may retry."""
+    if not title:
+        return "empty"
+    low = title.lower()
+    if ("<function" in low or "<parameter" in low or "antml:" in low
+            or "```" in low):
+        return "tool-call/code text"
+    words = title.split()
+    if len(words) > MAX_TITLE_WORDS:
+        return "answer-shaped: %d words > %d" % (len(words), MAX_TITLE_WORDS)
+    if low in _TITLE_ECHO_REJECT:
+        return "prompt example echo"
+    return ""
+
+
+def _apply_title(cfg, tg, state, chat_id, thread_id, title, source):
+    """Set the session name with provenance `source` and mirror it onto the
+    topic. Main thread only - all SQLite/state writes stay here."""
     meta = state.ensure_meta(chat_id, thread_id)
-    if meta.get("name") or meta.get("_named"):
-        return
-    meta["_named"] = True
-    excerpt = (text or "").strip()[:1500]
-    content = None
+    meta["name"] = title
+    meta["name_src"] = source
+    if state.store:
+        state.store.set_session_name(chat_id, thread_id or 0, title)
+    if thread_id is not None:  # topic mirrors the session name
+        try:
+            tg.edit_topic(chat_id, thread_id, title)
+            state.topic_names[(chat_id, thread_id)] = title
+        except Exception as e:
+            log.warning("topic title rename failed: %s", e)
+    log.info("session titled (%s): chat=%s thread=%s %r",
+             source, chat_id, thread_id, title)
+
+
+def _naming_content(cfg, raw, images):
+    """What the titler looks at: the opening text (bounded), with the image
+    attached when the model is vision-capable, else a media descriptor."""
+    excerpt = (raw or "").strip()[:1500]
     if images:
         vision = False
         try:
@@ -1091,45 +1214,88 @@ def _maybe_name_session(cfg, tg, state, chat_id, thread_id, text, images):
                         "text": excerpt or "Name this conversation."}]
             for mime, b64 in images:
                 content.append(providers.image_part(mime, b64))
-        else:
-            kind = images[0][0]
-            content = "the user sent a media file (%s)%s" % (
-                kind, " - " + excerpt if excerpt else "")
+            return content
+        return "the user sent a media file (%s)%s" % (
+            images[0][0], " - " + excerpt if excerpt else "")
+    return excerpt or None
+
+
+def _maybe_name_session(cfg, tg, state, chat_id, thread_id, msg, images):
+    """Group 19, called at turn START (before the reply is generated).
+
+    The MODEL title is generated first - concurrently with the reply - in a
+    daemon thread that performs only the HTTP call; _finish_naming applies
+    it on the main thread, so a successful run renames exactly once. The
+    derived title is only the fallback when the model call times out or
+    returns faulty output - and it sticks: one attempt per session, no
+    retries (a retry would just rename twice). Returns the handle, or None.
+    """
+    meta = state.ensure_meta(chat_id, thread_id)
+    if meta.get("name"):
+        return None  # one attempt per session: model title or its fallback
+    raw = (msg.get("text") or msg.get("caption") or "").strip()
+    content = _naming_content(cfg, raw, images)
     if content is None:
-        if not excerpt:
-            return
-        content = excerpt
+        return None
     provider, api_key, model_id = _resolve_provider(cfg, cfg.default_model)
     if not api_key:
-        return
-    usage = {}
-    try:
-        out, _r, _t = providers.chat(
-            provider, api_key, model_id,
-            [{"role": "system",
-              "content": "Reply with ONLY the title of this new conversation: "
-                         "three or four words in Title Case naming its topic. "
-                         "No sentence, no quotes, no markdown, nothing else."},
-             {"role": "user", "content": content}],
-            session_id=SESSION_ID, usage_out=usage)
-    except Exception as e:
-        log.warning("session naming failed: %s", e)
-        return
-    _record_usage(cfg, state, chat_id, thread_id, usage, provider, model_id)
-    first = (out or "").strip().splitlines()[0] if (out or "").strip() else ""
-    title = _clean_title(first)
-    if not title:
-        return
-    meta["name"] = title
-    if state.store:
-        state.store.set_session_name(chat_id, thread_id or 0, title)
-    if thread_id is not None:  # topic mirrors the session name
+        return None
+    meta["_naming"] = True
+    handle = {"usage": {}, "provider": provider, "model": model_id,
+              "result": [None], "thread": None,
+              "raw": raw, "images": images}
+    messages = [{"role": "system", "content": TITLE_PROMPT},
+                {"role": "user", "content": content}]
+
+    def work():
+        """Daemon thread: one HTTP call, writes only its own dict."""
         try:
-            tg.edit_topic(chat_id, thread_id, title)
-            state.topic_names[(chat_id, thread_id)] = title
+            out, _r, _t = providers.chat_title(
+                provider, api_key, model_id, messages,
+                session_id=SESSION_ID, usage_out=handle["usage"])
+            handle["result"][0] = out
         except Exception as e:
-            log.warning("topic title rename failed: %s", e)
-    log.info("session titled: chat=%s thread=%s %r", chat_id, thread_id, title)
+            log.warning("session naming failed: %s", e)
+
+    thread = threading.Thread(target=work, name="title", daemon=True)
+    handle["thread"] = thread
+    thread.start()
+    return handle
+
+
+def _finish_naming(cfg, tg, state, chat_id, thread_id, handle, timeout=5):
+    """Join the naming thread (bounded) and apply its result on the main
+    thread. Success = exactly one rename (the model title). On timeout or
+    faulty output the derived title is the fallback - the session's single
+    attempt is spent, so the visible name never churns. Abandoning a live
+    thread is race-free: it only writes its own dict, and _naming is always
+    cleared here (the finally runs even on error/interrupt paths)."""
+    thread = handle.get("thread")
+    reason = None
+    if thread is not None:
+        thread.join(timeout)
+        if thread.is_alive():
+            reason = "timeout after %.0fs" % timeout
+    meta = state.ensure_meta(chat_id, thread_id)
+    meta.pop("_naming", None)
+    if handle.get("usage"):
+        _record_usage(cfg, state, chat_id, thread_id, handle["usage"],
+                      handle["provider"], handle["model"])
+    out = handle["result"][0]
+    title = _extract_title(out) if out else ""
+    reason = reason or _title_reject_reason(title)
+    if reason:
+        log.info("model title not used (%s): chat=%s thread=%s %r",
+                 reason, chat_id, thread_id, title)
+        if not meta.get("name"):  # stage 1 fallback, applied once
+            derived = (_derive_title(handle.get("raw"))
+                       or _media_placeholder(handle.get("images")))
+            if derived:
+                _apply_title(cfg, tg, state, chat_id, thread_id, derived,
+                             "derived")
+        return False
+    _apply_title(cfg, tg, state, chat_id, thread_id, title, "llm")
+    return True
 
 
 def _est_chars(history):
@@ -1243,12 +1409,19 @@ INTERRUPT_NOTE = ("[This run was interrupted by the user before it finished - "
 
 
 def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
-    key = state.chat_key(msg["chat"]["id"], thread_id)
+    chat_id = msg["chat"]["id"]
+    key = state.chat_key(chat_id, thread_id)
+    # titling starts WITH the user's message: stage 1 lands inline, stage 2
+    # generates concurrently with the reply (applied in the finally below)
+    naming = _maybe_name_session(cfg, tg, state, chat_id, thread_id, msg,
+                                 images)
     state.begin_turn(key)
     try:
         _ai_reply(cfg, tg, msg, thread_id, state, text, images)
     finally:
         state.end_turn(key)
+        if naming is not None:
+            _finish_naming(cfg, tg, state, chat_id, thread_id, naming)
 
 
 def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
@@ -1428,8 +1601,6 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         parts = md2tg.send_parts(answer, reasoning_md)
         for part in parts:
             tg.send(chat_id, part, thread_id)
-    # first answer delivered -> generate the session title (group 19)
-    _maybe_name_session(cfg, tg, state, chat_id, thread_id, text, images)
 
 
 def _deliver_interrupted(tg, state, msg, thread_id, partial, live):

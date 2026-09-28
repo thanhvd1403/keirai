@@ -2,6 +2,7 @@ import json
 import os
 import queue
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -913,8 +914,12 @@ class TestReplyTo(unittest.TestCase):
                                  "text": "remember me"}
         main.handle_message(make_config(stream_drafts=False), tg, m,
                             main.State(True))
-        user_texts = [msg_["content"] for msg_ in chat_mock.call_args[0][3]
-                      if msg_["role"] == "user" and isinstance(msg_["content"], str)]
+        # scan every call: the concurrent naming thread's call may land last
+        user_texts = [msg_["content"]
+                      for call in chat_mock.call_args_list
+                      for msg_ in call[0][3]
+                      if msg_["role"] == "user"
+                      and isinstance(msg_["content"], str)]
         self.assertTrue(any("user is replying to this message" in t
                             and "remember me" in t for t in user_texts))
 
@@ -1532,44 +1537,133 @@ class TestSessionCommands(unittest.TestCase):
 
 
 class TestSessionTitles(unittest.TestCase):
-    """P4 group 19: agent-generated session titles after the first message."""
+    """Group 19 two-stage titling: instant derived title + concurrent model
+    upgrade (OpenCode prompt / Hermes structure / oh-my-pi reject guard)."""
 
     def setUp(self):
         self.tg = FakeTG()
         self.state = main.State(True)
         self.cfg = make_config()
 
+    @staticmethod
+    def _is_naming(messages):
+        return any("title generator" in str(m.get("content") or "")
+                   for m in messages if m.get("role") == "system")
+
+    @classmethod
+    def _chat(cls, titles=(), answer="the answer", usage=None):
+        """Content-based side_effect: naming calls consume `titles`, main
+        turns get `answer`. Order-independent, so the concurrent naming
+        thread and the reply may interleave freely."""
+        pending = list(titles)
+
+        def fake(name, api_key, model, messages, **kw):
+            if cls._is_naming(messages):
+                if usage and kw.get("usage_out") is not None:
+                    kw["usage_out"].update(usage)
+                return (pending.pop(0) if pending else "", "", None)
+            return (answer, "", None)
+        return fake
+
+    @classmethod
+    def _naming_calls(cls, chat_mock):
+        return [c for c in chat_mock.call_args_list
+                if cls._is_naming(c[0][3])]
+
     @mock.patch.object(providers, "price_for", return_value=None)
     @mock.patch.object(providers, "chat")
     def test_title_after_first_message_then_stops(self, chat_mock, price_mock):
-        chat_mock.side_effect = [("the answer", "", None),
-                                 ("  Trip Planning!  ", "", None)]
+        chat_mock.side_effect = self._chat(["  Trip Planning!  "])
         main.handle_message(self.cfg, self.tg, msg(text="plan my trip"),
                             self.state)
         m = self.state.meta[(100, None)]
         self.assertEqual(m["name"], "Trip Planning")  # punctuation stripped
-        self.assertEqual(chat_mock.call_count, 2)
+        self.assertEqual(m["name_src"], "llm")
+        self.assertEqual(len(self._naming_calls(chat_mock)), 1)
         # second turn: no more naming calls
         main.handle_message(self.cfg, self.tg, msg(text="and hotels"),
                             self.state)
-        self.assertEqual(chat_mock.call_count, 3)
+        self.assertEqual(len(self._naming_calls(chat_mock)), 1)
         self.assertEqual(self.state.meta[(100, None)]["name"], "Trip Planning")
 
     @mock.patch.object(providers, "price_for", return_value=None)
     @mock.patch.object(providers, "chat")
+    def test_model_title_applied_once_after_reply(self, chat_mock, price_mock):
+        """No interim rename: nothing is applied while the reply is being
+        generated; the successful model title is the session's one rename."""
+        first = "Fix the checkout total rounding bug"
+        seen = {}
+
+        def fake(name, api_key, model, messages, **kw):
+            if self._is_naming(messages):
+                return ("Model Title", "", None)
+            seen["name"] = (self.state.meta.get((100, None)) or {}).get("name")
+            return ("answer", "", None)
+
+        chat_mock.side_effect = fake
+        main.handle_message(self.cfg, self.tg, msg(text=first), self.state)
+        self.assertIsNone(seen["name"])                # no rename before reply
+        meta = self.state.meta[(100, None)]
+        self.assertEqual(meta["name"], "Model Title")  # exactly one rename
+        self.assertEqual(meta["name_src"], "llm")
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_naming_runs_concurrently_with_the_reply(self, chat_mock,
+                                                     price_mock):
+        """The naming thread must be inside its call while the reply is
+        still being generated (not after it)."""
+        naming_entered = threading.Event()
+        saw = {}
+
+        def fake(name, api_key, model, messages, **kw):
+            if self._is_naming(messages):
+                naming_entered.set()
+                return ("Concurrent Title", "", None)
+            naming_entered.wait(5)
+            saw["during"] = naming_entered.is_set()
+            return ("answer", "", None)
+
+        chat_mock.side_effect = fake
+        main.handle_message(self.cfg, self.tg, msg(text="first message"),
+                            self.state)
+        self.assertTrue(saw.get("during"),
+                        "naming did not start during the reply")
+        self.assertEqual(self.state.meta[(100, None)]["name"],
+                         "Concurrent Title")
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
     def test_new_with_explicit_name_skips_naming(self, chat_mock, price_mock):
-        chat_mock.return_value = ("answer", "", None)
+        chat_mock.side_effect = self._chat(["Should Not Apply"])
         main.handle_message(self.cfg, self.tg, msg(text="/new my trip"),
                             self.state)
         main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
-        self.assertEqual(chat_mock.call_count, 1)  # only the answer call
+        self.assertEqual(len(self._naming_calls(chat_mock)), 0)
         self.assertEqual(self.state.meta[(100, None)]["name"], "my trip")
+        self.assertEqual(self.state.meta[(100, None)]["name_src"], "user")
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_user_rename_never_overwritten(self, chat_mock, price_mock):
+        chat_mock.side_effect = self._chat([""])  # naming yields nothing
+        main.handle_message(self.cfg, self.tg, msg(text="hello there"),
+                            self.state)
+        self.assertEqual(self.state.meta[(100, None)]["name_src"], "derived")
+        main.handle_message(self.cfg, self.tg, msg(text="/rename my name"),
+                            self.state)
+        self.assertEqual(self.state.meta[(100, None)]["name_src"], "user")
+        main.handle_message(self.cfg, self.tg, msg(text="and again"),
+                            self.state)
+        # user names settle it: no further naming calls, name untouched
+        self.assertEqual(len(self._naming_calls(chat_mock)), 1)
+        self.assertEqual(self.state.meta[(100, None)]["name"], "my name")
 
     @mock.patch.object(providers, "price_for", return_value=None)
     @mock.patch.object(providers, "chat")
     def test_title_renames_topic_in_flow(self, chat_mock, price_mock):
         self.cfg.topic_flow = True
-        chat_mock.side_effect = [("answer", "", None), ("Cats", "", None)]
+        chat_mock.side_effect = self._chat(["Cats"])
         main.handle_message(self.cfg, self.tg, msg(text="/new"), self.state)
         tid = self.tg.topics["New session"]
         main.handle_message(self.cfg, self.tg,
@@ -1581,13 +1675,12 @@ class TestSessionTitles(unittest.TestCase):
     @mock.patch.object(providers, "price_for", return_value=None)
     @mock.patch.object(providers, "chat")
     def test_media_only_message_named_from_media(self, chat_mock, price_mock):
-        chat_mock.side_effect = [("answer", "", None),
-                                 ("Sunset Photo", "", None)]
+        chat_mock.side_effect = self._chat(["Sunset Photo"])
         m = msg(text=None, photo=[{"file_id": "f1", "file_size": 100}])
         main.handle_message(self.cfg, self.tg, m, self.state)
         self.assertEqual(self.state.meta[(100, None)]["name"], "Sunset Photo")
         # the naming call got a media descriptor (vision off in this stub)
-        naming_msgs = chat_mock.call_args_list[1][0][3]
+        naming_msgs = self._naming_calls(chat_mock)[0][0][3]
         self.assertIn("media file", naming_msgs[1]["content"])
 
     @mock.patch.object(providers, "price_for")
@@ -1595,27 +1688,120 @@ class TestSessionTitles(unittest.TestCase):
     def test_media_only_message_with_vision_sends_image(self, chat_mock,
                                                         price_mock):
         price_mock.return_value = {"image": True}
-        chat_mock.side_effect = [("answer", "", None), ("Nice Pic", "", None)]
+        chat_mock.side_effect = self._chat(["Nice Pic"])
         m = msg(text=None, photo=[{"file_id": "f1", "file_size": 100}])
         main.handle_message(self.cfg, self.tg, m, self.state)
-        naming_content = chat_mock.call_args_list[1][0][3][1]["content"]
+        naming_content = self._naming_calls(chat_mock)[0][0][3][1]["content"]
         self.assertIsInstance(naming_content, list)
         self.assertTrue(any(p.get("type") == "image_url"
                             for p in naming_content))
         self.assertEqual(self.state.meta[(100, None)]["name"], "Nice Pic")
 
-
     @mock.patch.object(providers, "price_for", return_value=None)
     @mock.patch.object(providers, "chat")
     def test_title_marker_and_quotes_stripped(self, chat_mock, price_mock):
         """Light hygiene only - word choice is left to the prompt."""
-        chat_mock.side_effect = [
-            ("answer", "", None),
-            ("Title: \"Docker Networking\"", "", None)]
+        chat_mock.side_effect = self._chat(['Title: "Docker Networking"'])
         main.handle_message(self.cfg, self.tg, msg(text="help me deploy"),
                             self.state)
         self.assertEqual(self.state.meta[(100, None)]["name"],
                          "Docker Networking")
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_json_constrained_output_extracted(self, chat_mock, price_mock):
+        for reply, want in (
+                ('{"title": "Docker Networking Setup"}',
+                 "Docker Networking Setup"),
+                ('```json\n{"title": "Kubernetes Ingress TLS"}\n```',
+                 "Kubernetes Ingress TLS")):
+            chat_mock.side_effect = self._chat([reply])
+            state = main.State(True)
+            main.handle_message(self.cfg, self.tg, msg(text="fix ingress"), state)
+            self.assertEqual(state.meta[(100, None)]["name"], want)
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_answer_shaped_title_rejected_derived_stays(self, chat_mock,
+                                                        price_mock):
+        """>12 words = the model answered instead of titling: REJECTED (never
+        truncated), the derived title stays (oh-my-pi #7306)."""
+        answerish = ("I don't have any context about the registration system "
+                     "in this conversation so I cannot help with that now")
+        chat_mock.side_effect = self._chat([answerish])
+        main.handle_message(self.cfg, self.tg,
+                            msg(text="sort out the registration form"),
+                            self.state)
+        meta = self.state.meta[(100, None)]
+        self.assertEqual(meta["name"], "sort out the registration form")
+        self.assertEqual(meta["name_src"], "derived")  # not the answer
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_tool_call_text_rejected(self, chat_mock, price_mock):
+        garbage = '{"title": "<function=bash>pwd</function>"}'
+        chat_mock.side_effect = self._chat([garbage])
+        main.handle_message(self.cfg, self.tg, msg(text="run a command"),
+                            self.state)
+        meta = self.state.meta[(100, None)]
+        self.assertEqual(meta["name"], "run a command")  # derived kept
+        self.assertEqual(meta["name_src"], "derived")
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_long_title_accepted_without_cap(self, chat_mock, price_mock):
+        """Legit wordy-but-title-shaped output passes verbatim: 10 words,
+        >80 chars - no char cap, no word truncation."""
+        long_ok = ("Optimize PostgreSQL database connection pool exhaustion "
+                   "in checkout payment microservice latency")
+        self.assertGreater(len(long_ok.split()), 7)
+        self.assertGreater(len(long_ok), 80)
+        chat_mock.side_effect = self._chat([long_ok])
+        main.handle_message(self.cfg, self.tg, msg(text="db pool issue"),
+                            self.state)
+        self.assertEqual(self.state.meta[(100, None)]["name"], long_ok)
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_single_attempt_derived_fallback_sticks(self, chat_mock,
+                                                    price_mock):
+        """One attempt per session: faulty output -> derived fallback, and
+        later messages never rename again (retries would churn the name)."""
+        garbage = ("Sorry, as an AI assistant I need much more information "
+                   "before I can possibly help you with this request today")
+        chat_mock.side_effect = self._chat([garbage] * 10)
+        for i in range(4):
+            main.handle_message(self.cfg, self.tg, msg(text="message %d" % i),
+                                self.state)
+        self.assertEqual(len(self._naming_calls(chat_mock)), 1)  # one attempt
+        meta = self.state.meta[(100, None)]
+        self.assertEqual(meta["name"], "message 0")   # derived, never garbage
+        self.assertEqual(meta.get("_naming"), None)   # flag cleared
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_media_fallback_placeholder_on_faulty_output(self, chat_mock,
+                                                         price_mock):
+        chat_mock.side_effect = self._chat(
+            ["I cannot possibly name this media because there is not enough "
+             "context available in the conversation for me right now friend"])
+        m = msg(text=None, photo=[{"file_id": "f1", "file_size": 100}])
+        main.handle_message(self.cfg, self.tg, m, self.state)
+        meta = self.state.meta[(100, None)]
+        self.assertEqual(meta["name"], "Photo")  # media placeholder fallback
+        self.assertEqual(meta["name_src"], "derived")
+
+    @mock.patch.object(providers, "price_for", return_value=None)
+    @mock.patch.object(providers, "chat")
+    def test_naming_usage_recorded(self, chat_mock, price_mock):
+        chat_mock.side_effect = self._chat(
+            ["Counted Title"],
+            usage={"prompt_tokens": 50, "completion_tokens": 10})
+        main.handle_message(self.cfg, self.tg, msg(text="hello world"),
+                            self.state)
+        meta = self.state.meta[(100, None)]
+        self.assertEqual(int(meta["tokens_in"]), 50)
+        self.assertEqual(int(meta["tokens_out"]), 10)
 
 
 class TestConfigPersistence(unittest.TestCase):
