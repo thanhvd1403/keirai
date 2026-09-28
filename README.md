@@ -4,6 +4,8 @@
 > for personal use and changes fast. Expect rough edges, breaking changes and
 > the occasional broken session. Use at your own risk — and keep a backup of
 > `sessions.db` if you care about your history.
+>
+> 
 
 A lightweight AI agent that lives in Telegram. It runs on a small server
 (1GB RAM), talks to OpenCode Zen / OpenCode Go models, and can actually *do*
@@ -19,6 +21,10 @@ pages.
 - **Context management**: auto-compaction at 100% of the model's real context window, manual `/compact`
 - **Usage accounting**: tokens and notional cost per session (`/cost`)
 - **Go-first inference** with automatic fallback to Zen on provider errors
+
+> *A small note from the human:*
+> *- Why I bult this: I had a 1GB server lying around and it wouldn't run other harnesses without issues. So I built one for myself to use.*
+> *- Yes, this is 100% AI code. Feel free to call it AI slop if you will.*
 
 ## Requirements
 
