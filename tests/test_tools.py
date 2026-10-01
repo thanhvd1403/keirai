@@ -136,21 +136,27 @@ class TestBash(unittest.TestCase):
             ctx={"interrupt": stop})
         self.assertIn("INTERRUPTED by the user", out)
 
-    def test_long_output_saved_to_file(self):
+    def test_long_output_spilled_to_session_dir(self):
+        """Output over tool_output_max_bytes is saved whole under
+        sessions/<sid>/tool_output/; the model gets preview + path."""
         with tempfile.TemporaryDirectory() as td:
-            cfg = config_mod.Config({"tools_enabled": True, "bash_timeout": 10},
-                                    path=os.path.join(td, "config.toml"))
-            with mock.patch.object(tools, "OUTPUT_CAP", 50):
-                out = tools.execute(cfg, "bash", {
-                    "command": "python -c \"print('z' * 500)\""})
+            cfg = config_mod.Config(
+                {"tools_enabled": True, "bash_timeout": 10,
+                 "tool_output_max_bytes": 50},
+                path=os.path.join(td, "config.toml"))
+            ctx = {"spill_session": "20261001-1200-ab12"}
+            out = tools.execute(cfg, "bash", {
+                "command": "python -c \"print('z' * 500)\""}, ctx=ctx)
             self.assertIn("output truncated", out)
             self.assertIn("read_file", out)
-            # the referenced file exists and holds the full output
-            start = out.index("saved to ") + len("saved to ")
-            path = out[start:].split(" ", 1)[0].rstrip("-").strip()
+            self.assertTrue(out.startswith("exit code 0"))  # head preview
+            path, total = ctx["_spill"]
+            self.assertIn(os.path.join("sessions", "20261001-1200-ab12",
+                                       "tool_output"), path)
             self.assertTrue(os.path.isfile(path), path)
-            with open(path) as f:
-                self.assertGreater(len(f.read()), 500 - 60)
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(len(f.read()), total)
+            self.assertGreater(total, 500)
 
 
 class TestExecute(unittest.TestCase):
@@ -164,12 +170,28 @@ class TestExecute(unittest.TestCase):
         out = tools.execute(self.cfg, "read_file", {"path": ""})
         self.assertTrue(out.startswith("error:"))
 
-    def test_result_cap(self):
-        with mock.patch.object(tools, "RESULT_CAP", 10):
-            out = tools.execute(self.cfg, "read_file",
-                                {"path": __file__, "max_chars": 100})
-        self.assertLessEqual(len(out), 10 + 60)
-        self.assertIn("truncated", out)
+    def test_result_spilled_over_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = config_mod.Config(
+                {"tools_enabled": True, "tool_output_max_bytes": 10},
+                path=os.path.join(td, "config.toml"))
+            ctx = {"spill_session": "s1"}
+            out = tools.execute(cfg, "read_file",
+                                {"path": __file__, "max_chars": 100}, ctx)
+            self.assertIn("output truncated", out)
+            self.assertLessEqual(len(out), 10 + 200)
+            path, total = ctx["_spill"]
+            self.assertTrue(os.path.isfile(path), path)
+            self.assertIn(os.path.join("sessions", "s1", "tool_output"), path)
+            self.assertGreater(total, 10)
+
+    def test_small_output_not_spilled(self):
+        ctx = {"spill_session": "s1"}
+        out = tools.execute(self.cfg, "read_file",
+                            {"path": __file__, "max_chars": 50}, ctx)
+        self.assertNotIn("_spill", ctx)
+        self.assertNotIn("saved to", out)
+        self.assertIn("Tests for the agent", out)  # content came back inline
 
     def test_preview(self):
         p = tools.preview("bash", {"command": "ls -la\ncat x", "timeout_seconds": 5})

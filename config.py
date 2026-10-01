@@ -4,6 +4,7 @@ Requires Python 3.11+ (tomllib is in the stdlib).
 """
 import os
 import re
+import threading
 
 try:
     import tomllib
@@ -46,6 +47,7 @@ class Config:
         self.max_file_mb = int(data.get("max_file_mb", 20))
         self.tools_enabled = bool(data.get("tools_enabled", True))
         self.bash_timeout = int(data.get("bash_timeout", 30))
+        self.tool_output_max_bytes = int(data.get("tool_output_max_bytes", 40_000))
         self.parallel_api_key = (os.environ.get("PARALLEL_API_KEY")
                                  or data.get("parallel_api_key", ""))
         self.system_prompt = data.get("system_prompt", "You are Keirai, a lightweight AI agent.")
@@ -97,6 +99,9 @@ def load(path=None):
     return Config({}, path=None)
 
 
+_write_lock = threading.Lock()  # read-modify-write from concurrent workers
+
+
 def write_value(cfg, key, value):
     """Surgically set a top-level `key = value` in the config file while
     keeping every comment and section (used for `topic_flow` and
@@ -110,21 +115,22 @@ def write_value(cfg, key, value):
         lit = '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
     else:
         lit = str(value)
-    with open(cfg.path, "r", encoding="utf-8") as f:
-        lines = f.read().splitlines()
-    pattern = re.compile(r"^(\s*)%s\s*=.*$" % re.escape(key))
-    for i, line in enumerate(lines):
-        m = pattern.match(line)
-        if m:
-            lines[i] = "%s%s = %s" % (m.group(1), key, lit)
-            break
-    else:
-        # not present -> insert before the first section header (top level)
-        at = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")),
-                  len(lines))
-        lines.insert(at, "%s = %s" % (key, lit))
-    with open(cfg.path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    with _write_lock:
+        with open(cfg.path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        pattern = re.compile(r"^(\s*)%s\s*=.*$" % re.escape(key))
+        for i, line in enumerate(lines):
+            m = pattern.match(line)
+            if m:
+                lines[i] = "%s%s = %s" % (m.group(1), key, lit)
+                break
+        else:
+            # not present -> insert before the first section header (top level)
+            at = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")),
+                      len(lines))
+            lines.insert(at, "%s = %s" % (key, lit))
+        with open(cfg.path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
     return lit
 
 

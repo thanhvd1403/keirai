@@ -92,7 +92,16 @@ typed confirmations.
 **Tools**: the model can read/write/edit files, run shell commands (with a
 destructive-command blacklist and timeout), search and fetch the web, and
 browse pages if Lightpanda is installed. Tool rounds run until the model
-stops; `/stop` interrupts a runaway turn.
+stops; `/stop` interrupts a runaway turn. Every round (input + results) is
+kept in the session history, so the bot doesn't re-read the same file each
+message; outputs over 40 KB spill to `sessions/<id>/tool_output/` - the
+model sees a preview + path, history keeps only the path.
+
+**Concurrency & steering**: every session/topic runs on its own worker - a
+long turn in one topic never blocks another topic (commands included). A
+message sent while your session is mid-turn joins the AI's context at the
+next tool step, so you can steer a wrong direction without `/stop`. Each
+round's reasoning is shown live as a collapsible block (`/thinking off`).
 
 **Media**: send a photo to talk about it (vision models), or send media with
 the caption `media_test` to verify the round-trip.

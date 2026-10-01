@@ -61,6 +61,10 @@ class State:
         self._turn_lock = threading.Lock()
         self.active_turns = {}   # chat_key -> True while a reply/tool turn runs
         self.interrupts = set()  # chat_keys the user asked to /stop
+        self.turn_inbox = {}     # chat_key -> [updates sent mid-turn]
+        # slot bookkeeping (/new, /session) runs on session workers that may
+        # be concurrent within a chat - guard counters + slot moves
+        self._slot_lock = threading.RLock()
         if store:
             self._load()
 
@@ -86,6 +90,24 @@ class State:
     def interrupted(self, key):
         with self._turn_lock:
             return key in self.interrupts
+
+    # ------------------------------------------- mid-turn message inbox
+    # A plain message in a session whose turn is running is parked here and
+    # folded into context at the next tool boundary (steering without /stop)
+    # instead of waiting for the turn to end.
+
+    def inject(self, key, upd):
+        """Park `upd` for the turn running on `key`. True when injected."""
+        with self._turn_lock:
+            if key in self.active_turns:
+                self.turn_inbox.setdefault(key, []).append(upd)
+                return True
+            return False
+
+    def take_inbox(self, key):
+        """Pending mid-turn messages for `key` (thread-safe swap)."""
+        with self._turn_lock:
+            return self.turn_inbox.pop(key, None) or []
 
     def _load(self):
         for chat_id, thread_id, model, messages, updated in self.store.load_sessions():
@@ -181,50 +203,54 @@ class State:
         return m.get("name") or self.topic_names.get(key) or ""
 
     def free_slot(self, chat_id):
-        used = {k[1] for k in self.history if k[0] == chat_id}
-        used |= {k[1] for k in self.meta if k[0] == chat_id}
-        slot = -1
-        while slot in used:
-            slot -= 1
-        return slot
+        with self._slot_lock:
+            used = {k[1] for k in self.history if k[0] == chat_id}
+            used |= {k[1] for k in self.meta if k[0] == chat_id}
+            slot = -1
+            while slot in used:
+                slot -= 1
+            return slot
 
     def move_session(self, chat_id, frm, to):
         """Relocate session data between slots (state + store). Target free."""
-        src = self.chat_key(chat_id, frm)
-        dst = self.chat_key(chat_id, to)
-        if src == dst:
-            return
-        if dst in self.history or dst in self.meta:
-            raise ValueError("target slot occupied: %r" % (dst,))
-        for attr in ("history", "model", "meta", "updated"):
-            d = getattr(self, attr)
-            if src in d:
-                d[dst] = d.pop(src)
-        if self.store:
-            self.store.move_session(chat_id, frm or 0, to or 0)
+        with self._slot_lock:
+            src = self.chat_key(chat_id, frm)
+            dst = self.chat_key(chat_id, to)
+            if src == dst:
+                return
+            if dst in self.history or dst in self.meta:
+                raise ValueError("target slot occupied: %r" % (dst,))
+            for attr in ("history", "model", "meta", "updated"):
+                d = getattr(self, attr)
+                if src in d:
+                    d[dst] = d.pop(src)
+            if self.store:
+                self.store.move_session(chat_id, frm or 0, to or 0)
 
     def displace(self, chat_id, thread_id):
         """Park whatever session occupies the slot (kept, recoverable)."""
-        key = self.chat_key(chat_id, thread_id)
-        if key not in self.history and key not in self.meta:
-            return False
-        self.move_session(chat_id, thread_id, self.free_slot(chat_id))
-        return True
+        with self._slot_lock:
+            key = self.chat_key(chat_id, thread_id)
+            if key not in self.history and key not in self.meta:
+                return False
+            self.move_session(chat_id, thread_id, self.free_slot(chat_id))
+            return True
 
     def create_session(self, chat_id, thread_id, name=None):
         """Fresh empty session bound at the slot."""
-        key = self.chat_key(chat_id, thread_id)
-        self.history[key] = []
-        self.meta[key] = {"session_id": sessions.new_session_id(),
-                          "name": name,
-                          # provenance: a name from /new <name> is the user's
-                          "name_src": ("user" if name else None),
-                          "cost_usd": 0.0, "tokens_in": 0,
-                          "tokens_out": 0, "tokens_cached_read": 0,
-                          "tokens_cached_write": 0}
-        self.updated[key] = time.time()
-        if self.store:
-            self.store.create_session(chat_id, thread_id or 0, name)
+        with self._slot_lock:
+            key = self.chat_key(chat_id, thread_id)
+            self.history[key] = []
+            self.meta[key] = {"session_id": sessions.new_session_id(),
+                              "name": name,
+                              # provenance: a name from /new <name> is the user's
+                              "name_src": ("user" if name else None),
+                              "cost_usd": 0.0, "tokens_in": 0,
+                              "tokens_out": 0, "tokens_cached_read": 0,
+                              "tokens_cached_write": 0}
+            self.updated[key] = time.time()
+            if self.store:
+                self.store.create_session(chat_id, thread_id or 0, name)
 
     def remove_topic_ref(self, chat_id, tid):
         """Drop a dead topic from the registry (after a failed ping)."""
@@ -238,9 +264,10 @@ class State:
         return self.history.setdefault(self.chat_key(chat_id, thread_id), [])
 
     def next_session_num(self, chat_id):
-        n = self.session_count.get(chat_id, 0) + 1
-        self.session_count[chat_id] = n
-        return n
+        with self._slot_lock:
+            n = self.session_count.get(chat_id, 0) + 1
+            self.session_count[chat_id] = n
+            return n
 
 
 # ---------------------------------------------------------------- commands
@@ -884,6 +911,7 @@ def cmd_compact(cfg, tg, msg, thread_id, state):
     try:
         history[:] = _compact(cfg, provider, api_key, model_id, history,
                               SESSION_ID, usage_out=cusage)
+        _strip_orphan_tools(history)
     except Exception as e:
         _err(tg, msg, thread_id, "compaction failed: %s" % e)
         return
@@ -1341,6 +1369,38 @@ def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4,
     return marker + tail
 
 
+def _close_tool_rounds(history):
+    """Answer any tool_calls left unanswered (turn ended mid-round: /stop,
+    provider error). Providers reject a history whose tool_calls have no
+    matching tool result, so unanswered calls get a placeholder result -
+    the round stays in context either way (user directive)."""
+    answered = {m.get("tool_call_id") for m in history if m.get("role") == "tool"}
+    missing = []
+    for m in history:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                if tc.get("id") not in answered:
+                    missing.append(tc.get("id"))
+    for tid in missing:
+        history.append({"role": "tool", "tool_call_id": tid,
+                        "content": "[not executed: the turn ended before this "
+                                   "call ran]"})
+
+
+def _strip_orphan_tools(history):
+    """Front-trimming can cut an assistant/tool_calls pair in half, leaving
+    leading tool messages whose call was trimmed away - the API rejects
+    those. Drop them (their assistant is already summarized/gone)."""
+    while history and history[0].get("role") == "tool":
+        history.pop(0)
+
+
+def _trim(history, limit=None):
+    """Keep the newest messages, then drop orphaned leading tool results."""
+    del history[:-(limit or HISTORY_LIMIT)]
+    _strip_orphan_tools(history)
+
+
 def _flush_live(tg, live, chat_id, thread_id, reasoning, answer, show_reasoning):
     """Push current partial state to Telegram: drafts in private chats,
     send/edit of a placeholder message elsewhere (live edits)."""
@@ -1406,6 +1466,44 @@ def _stream_answer(tg, msg, live, stop, provider, api_key, model_id, messages,
 
 INTERRUPT_NOTE = ("[This run was interrupted by the user before it finished - "
                   "any running command/tool did not complete.]")
+
+
+def _injected_user_msg(upd):
+    """A plain message sent while a turn was running: folded into context at
+    the next tool boundary so the user can steer the work without /stop."""
+    m = upd["message"]
+    text = m.get("text") or ""
+    reply_ctx = _reply_context(m)
+    if reply_ctx:
+        text = reply_ctx + "\n\n" + text
+    return {"role": "user",
+            "content": "[sent while you were working on this turn - take it "
+                       "into account and continue]\n" + text}
+
+
+def _send_thinking_block(tg, chat_id, thread_id, reasoning_md, cfg):
+    """Persist ONE round's reasoning as its own collapsible block. Every
+    completed round gets one, so the user can watch the model think round by
+    round (and steer mid-turn) instead of seeing only the last block after
+    the turn ends. Cosmetic: never lets a send failure break the turn."""
+    sent = False
+    if cfg.rich_messages:
+        try:
+            for chunk in md2tg.split(reasoning_md, md2tg.RICH_LIMIT):
+                tg.send_rich(chat_id,
+                             html="<details><summary>\U0001f914 Thinking</summary>%s"
+                                  "</details>" % chunk,
+                             thread_id=thread_id)
+            sent = True
+        except Exception as e:
+            log.warning("rich thinking block failed (%s) - falling back", e)
+    if not sent:
+        try:
+            for part in md2tg.send_parts("", reasoning_md):
+                if part.strip():
+                    tg.send(chat_id, part, thread_id)
+        except Exception as e:
+            log.warning("thinking block failed: %s", e)
 
 
 def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
@@ -1481,17 +1579,23 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         try:
             history[:] = _compact(cfg, provider_name, api_key, model_id, history,
                                   session_id, usage_out=cusage)
+            _strip_orphan_tools(history)
             _record_usage(cfg, state, chat_id, thread_id, cusage,
                           provider_name, model_id)
             log.info("auto-compact: chat=%s thread=%s %d -> %d msgs",
                      chat_id, thread_id, before, len(history))
         except Exception as e:
             log.warning("auto-compact failed (%s) - trimming oldest instead", e)
-            del history[:-6]
+            _trim(history, 6)
 
+    _close_tool_rounds(history)  # safety net: no dangling tool_calls ever
     messages = ([{"role": "system", "content": cfg.system_prompt}] if cfg.system_prompt else []) + history[-HISTORY_LIMIT:]
     tool_specs = tools_mod.available_specs(cfg)
-    ctx = {"session_id": session_id, "interrupt": stop}
+    # session_id stays the anonymized app-wide constant (provider header +
+    # MCP args); spill_session is this session's own id -> spill files land
+    # in sessions/<session-id>/tool_output/
+    ctx = {"session_id": session_id, "interrupt": stop,
+           "spill_session": state.ensure_meta(chat_id, thread_id).get("session_id")}
     live = None
     if cfg.rich_messages and cfg.stream_drafts:
         live = {"mode": "draft" if msg["chat"].get("type") == "private" else "edit",
@@ -1500,7 +1604,17 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     reasoning, answer = None, None
     interrupted = False
     rounds = 0
+    show = state.thinking_on(msg["from"]["id"])  # stable: /thinking queues
     while True:  # unbounded: runs until the model stops calling tools
+        # fold in messages that arrived mid-turn: they were sent after the
+        # previous tool use finished, so the model sees them right now and
+        # can be steered without interrupting the run
+        for extra in state.take_inbox(key):
+            injected = _injected_user_msg(extra)
+            history.append(injected)
+            messages.append(injected)
+            log.info("mid-turn message folded into context: chat=%s thread=%s",
+                     chat_id, thread_id)
         if stop():
             interrupted = True
             break
@@ -1522,7 +1636,9 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             try:
                 answer, reasoning, tcs = pcall(messages, tools=tool_specs or None)
             except Exception as e:
-                history.pop()  # don't keep failed turns
+                # keep the turn (user message + any tool rounds) per policy;
+                # just close unanswered calls so the next request is valid
+                _close_tool_rounds(history)
                 state.persist(chat_id, thread_id)
                 _err(tg, msg, thread_id, "%s error: %s" % (provider_name, e))
                 return
@@ -1533,13 +1649,21 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             break  # the model produced its final text
         rounds += 1
         log.info("tool round %d: %d call(s)", rounds, len(tcs))
-        # run the tools the model asked for
-        messages.append({"role": "assistant", "content": answer or "",
-                         "tool_calls": [
-                             {"id": t["id"], "type": "function",
-                              "function": {"name": t["name"],
-                                           "arguments": json.dumps(t["arguments"])}}
-                             for t in tcs]})
+        # this round's reasoning becomes a permanent block BEFORE the tools
+        # run - every block is shown as it happens, not just the last one
+        if show and (reasoning or "").strip():
+            _send_thinking_block(tg, chat_id, thread_id, reasoning, cfg)
+        # run the tools the model asked for - the round (input + results) is
+        # recorded in history too, so the next turn remembers what happened
+        # instead of re-reading the same file over and over
+        tc_msg = {"role": "assistant", "content": answer or "",
+                  "tool_calls": [
+                      {"id": t["id"], "type": "function",
+                       "function": {"name": t["name"],
+                                    "arguments": json.dumps(t["arguments"])}}
+                      for t in tcs]}
+        messages.append(tc_msg)
+        history.append(tc_msg)
         for t in tcs:
             if stop():
                 interrupted = True
@@ -1551,10 +1675,21 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
                         thread_id)
             except tg_mod.TelegramError:
                 pass
+            ctx.pop("_spill", None)
             result = tools_mod.execute(cfg, t["name"], t["arguments"], ctx)
+            spill = ctx.pop("_spill", None)
             messages.append({"role": "tool", "tool_call_id": t["id"],
                              "content": result})
-            log.info("tool %s -> %d chars", t["name"], len(result))
+            if spill:  # over the byte limit: history keeps only the path
+                path, total = spill
+                stored = ("[full tool output saved to %s (%d bytes) - use "
+                          "read_file to view it]" % (path, total))
+            else:
+                stored = result
+            history.append({"role": "tool", "tool_call_id": t["id"],
+                            "content": stored})
+            log.info("tool %s -> %d chars%s", t["name"], len(result),
+                     ", spilled" if spill else "")
             if stop():
                 interrupted = True
                 break
@@ -1572,7 +1707,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         try:
             answer, reasoning, _ = pcall(messages)
         except Exception as e:
-            history.pop()
+            _close_tool_rounds(history)
             state.persist(chat_id, thread_id)
             _err(tg, msg, thread_id, "%s error: %s" % (provider_name, e))
             return
@@ -1585,10 +1720,9 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
              chat_id, thread_id, rounds, len(answer or ""))
 
     history.append({"role": "assistant", "content": answer})
-    del history[:-HISTORY_LIMIT]
+    _trim(history)
     state.persist(chat_id, thread_id)
 
-    show = state.thinking_on(msg["from"]["id"])
     reasoning_md = reasoning if (show and reasoning and reasoning.strip()) else None
     sent = False
     if cfg.rich_messages:
@@ -1607,9 +1741,10 @@ def _deliver_interrupted(tg, state, msg, thread_id, partial, live):
     """Record the /stop interruption in context and tell the user."""
     chat_id = msg["chat"]["id"]
     history = state.get_history(chat_id, thread_id)
+    _close_tool_rounds(history)  # keep the partial round; close its calls
     body = (((partial or "").strip() + "\n\n") if (partial or "").strip() else "")
     history.append({"role": "assistant", "content": body + INTERRUPT_NOTE})
-    del history[:-HISTORY_LIMIT]
+    _trim(history)
     state.persist(chat_id, thread_id)
     if live and live.get("msg_id"):  # drop the half-finished live message
         try:
@@ -1930,10 +2065,13 @@ def _reply_context(msg):
 
 
 # ------------------------------------------------------- /stop + update watcher
-# The bot is single-threaded: while a reply/tool turn runs, no one polls
-# getUpdates. A watcher thread owns polling forever, feeds updates to a queue
-# the main loop drains, and intercepts /stop so an in-flight turn can be
-# interrupted via a thread-safe flag (everything else is queued, never lost).
+# Concurrency model: a watcher thread owns getUpdates (and intercepts /stop
+# for the session's running turn via a thread-safe flag). A single dispatcher
+# routes every other update: a plain message in a session with an active turn
+# is injected into that turn (folded into context at the next tool boundary);
+# everything else lands on the session's own queue. One worker thread per
+# session key runs that queue - messages inside a session stay ordered,
+# sessions/topics run in parallel and never block each other.
 
 def _msg_key(msg):
     return (msg["chat"]["id"], msg.get("message_thread_id"))
@@ -1976,6 +2114,69 @@ def _watch_updates(tg, state, out_q):
         for upd in updates:
             offset = upd["update_id"] + 1
             _route_update(state, out_q, upd)
+
+
+def _dispatch_update(cfg, tg, state, workers, upd):
+    """Route one update (runs on the single dispatcher thread).
+
+    Plain text in a NORMAL-path session whose turn is active -> inject into
+    the running turn (steering without /stop). Everything else (commands,
+    media, other sessions, gated paths) -> that session's queue, so a long
+    turn only ever delays its OWN session."""
+    msg = upd.get("message")
+    if not msg:
+        return
+    text = (msg.get("text") or "").strip()
+    media = any(k in msg for k in ("photo", "document", "video",
+                                   "voice", "audio"))
+    thread_id = msg.get("message_thread_id")
+    flow = cfg.topic_flow
+    normal_path = bool(thread_id is not None) == bool(flow)
+    user = msg.get("from") or {}
+    mine = state.bot_id is None or user.get("id") != state.bot_id
+    if (text and not text.startswith("/") and not media and normal_path
+            and mine and cfg.is_allowed(user.get("id"), user.get("username"))
+            and state.inject(_msg_key(msg), upd)):
+        log.info("mid-turn message injected: chat=%s thread=%s",
+                 msg["chat"]["id"], thread_id)
+        return
+    _session_submit(cfg, tg, state, workers, _msg_key(msg), upd)
+
+
+def _session_submit(cfg, tg, state, workers, key, upd):
+    """Queue `upd` on the session's own worker (created on first use)."""
+    q = workers.get(key)
+    if q is None:
+        q = queue.Queue()
+        workers[key] = q
+        threading.Thread(target=_session_worker, args=(cfg, tg, state, key, q),
+                         daemon=True, name="s-%s-%s" % key).start()
+    q.put(upd)
+
+
+def _session_worker(cfg, tg, state, key, q):
+    """Process one session's updates in arrival order, forever."""
+    while True:
+        _run_update(cfg, tg, state, q.get())
+        # mid-turn messages that never reached a boundary (the turn ended
+        # first) are handled now, before anything later queued
+        for extra in state.take_inbox(key):
+            _run_update(cfg, tg, state, extra)
+
+
+def _run_update(cfg, tg, state, upd):
+    msg = upd.get("message")
+    if not msg:
+        return
+    try:
+        handle_message(cfg, tg, msg, state)
+    except Exception as e:
+        log.exception("handler error")
+        try:
+            tg.send(msg["chat"]["id"], "error: %s" % _esc(str(e)),
+                    msg.get("message_thread_id"))
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- main
@@ -2037,19 +2238,9 @@ def main():
     out_q = queue.Queue()
     threading.Thread(target=_watch_updates, args=(tg, state, out_q),
                      daemon=True, name="updates").start()
+    workers = {}  # session key -> queue; a worker thread per active session
     while True:
-        upd = out_q.get()
-        msg = upd.get("message")
-        if not msg:
-            continue
-        try:
-            handle_message(cfg, tg, msg, state)
-        except Exception as e:
-            log.exception("handler error")
-            try:
-                tg.send(msg["chat"]["id"], "error: %s" % _esc(str(e)), msg.get("message_thread_id"))
-            except Exception:
-                pass
+        _dispatch_update(cfg, tg, state, workers, out_q.get())
 
 
 # ---------------------------------------------------------------- helpers

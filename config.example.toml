@@ -16,6 +16,8 @@ stream_drafts = true                      # live streaming via sendRichMessageDr
 # ---- agent tools (P2)
 tools_enabled = true                     # master switch for LLM tools (files/shell/web/browser)
 bash_timeout = 30                        # default shell timeout in seconds (the agent may override per call, 1-300)
+tool_output_max_bytes = 40000            # tool output over this (bytes; 40000 = 40k ASCII chars) is saved to
+                                         # sessions/<session-id>/tool_output/ - the model sees preview + path, history keeps only the path
 # parallel_api_key = ""                  # optional: raises limits on the FREE Parallel Search MCP (platform.parallel.ai);
                                          # web_search/web_fetch work anonymously without it
 # Lightpanda browser: run `bash deploy/install_lightpanda.sh` - the browse

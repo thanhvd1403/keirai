@@ -27,7 +27,7 @@ keirai/
 ├── AGENTS.md            # This file - project goals and rules
 ├── TODO.md              # Planned features
 ├── LICENSE              # AGPLv3
-├── .gitignore           # Ignores config.toml (secrets), sessions.db, tools/, cache/, logs/, __pycache__
+├── .gitignore           # Ignores config.toml (secrets), sessions.db, sessions/, tools/, cache/, logs/, __pycache__
 ├── main.py              # Entry point: polling loop, commands, routing, streaming, tool loop, /stop, topic flow, /session, titles
 ├── config.py            # Config loading (TOML + env overrides)
 ├── telegram.py          # Telegram Bot API client (raw HTTP, multipart, rich messages, live edits)
@@ -57,7 +57,7 @@ Run tests: `python -m unittest discover -s tests`
 
 ## Current Status
 
-P0 + P1 + P2 + P3 + P4 complete and tested (230 tests). The bot does:
+P0 + P1 + P2 + P3 + P4 complete and tested (241 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
@@ -67,9 +67,11 @@ P0 + P1 + P2 + P3 + P4 complete and tested (230 tests). The bot does:
 - Session persistence in SQLite (`sessions.db`): history, per-session model, topic registry - survives restarts; `/delete` clears one session's context
 - Context window management: `/context` shows used/max against the model's **real context window** (models.dev tokens, chars shown too); auto-compact fires at **100% of that window** by default (`context_limit_chars` in config.toml overrides); `/compact` manual (summarize older messages, keep last 4)
 - CLI: `python cli.py list|delete|rename` for session admin without Telegram
-- Agent tools (OpenAI function-calling, `tools.py`): `read_file`/`write_file`/`edit_file`, `bash` (destructive-command blacklist, agent-settable 1-300s timeout, long output saved to `logs/bash-out-*.txt`), `web_search`/`web_fetch` (Parallel Search MCP - free, no key), optional `browse` (Lightpanda, install via `deploy/install_lightpanda.sh` -> `./tools/lightpanda`)
-- Tool rounds run in-turn **uncapped** (`/stop` interrupts a runaway turn); only the final answer lands in history; each turn logs `tool round N: X call(s)` and `turn done: ... tool_rounds=...`
+- Agent tools (OpenAI function-calling, `tools.py`): `read_file`/`write_file`/`edit_file`, `bash` (destructive-command blacklist, agent-settable 1-300s timeout), `web_search`/`web_fetch` (Parallel Search MCP - free, no key), optional `browse` (Lightpanda, install via `deploy/install_lightpanda.sh` -> `./tools/lightpanda`)
+- Tool rounds (input + results) persist in session history - the next turn carries them, so no re-reading the same file every message; failed/interrupted rounds stay too (unanswered calls get a "[not executed...]" placeholder). Output over `tool_output_max_bytes` (default 40 KB) spills to `sessions/<session-id>/tool_output/` - model sees preview + path, history keeps only the path
+- Tool rounds run in-turn **uncapped** (`/stop` interrupts a runaway turn); each turn logs `tool round N: X call(s)` and `turn done: ... tool_rounds=...`
 - `/stop` interrupts a running reply/tool: an update-watcher thread owns getUpdates, intercepts /stop mid-turn, kills running `bash`, and records a neutral "[This run was interrupted by the user...]" marker in context
+- Concurrent sessions: a dispatcher gives each session (chat + topic) its own worker - a turn in one topic never blocks another topic's messages or commands; a plain message sent while your own session is mid-turn is folded into context at the next tool boundary (marked "[sent while you were working...]") so you can steer without `/stop`; every round's reasoning is shown live as its own collapsible block (`/thinking off` hides)
 - Reply-to/quote context: replies and quoted parts are injected into the prompt as annotations (item 17)
 - Dynamic `/help` built from the command registry; commands registered with `setMyCommands`; anonymized app-wide session header (`x-opencode-session: keirai` - no chat ids leave the machine) + `keirai/0.1` user agent
 - Regular-message fallback path: Markdown -> Telegram HTML rendering with 4096-char splitting (never breaks code blocks; tables as aligned `<pre>`, nested list bullets)

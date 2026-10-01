@@ -116,7 +116,7 @@
 
 > First real tools for the agent. Built on OpenAI function-calling specs
 > (`tools.py` registry: `available_specs(cfg)` + `execute(cfg, name, args, ctx)`);
-> tool rounds are not persisted to history - only the final answer is.
+> tool rounds persist in history (input + results; oversized output spills to a file - group 27).
 
 ### 14. File & shell tools
 - [x] `read_file` - read file contents (size caps: 200 KB hard, default 50 KB, `max_chars` arg)
@@ -125,7 +125,7 @@
 - [x] `bash` - execute shell commands
   - Timeout: config `bash_timeout` (default 30s), agent-settable per call (`timeout_seconds`, clamped 1-300)
   - Safety per agreed decision: destructive-command blacklist (rm -rf on /, mkfs, dd to /dev, shutdown/reboot, fork bombs, curl|sh, ...); NO path sandbox (single trusted operator)
-  - Output too long -> saved to `logs/bash-out-*.txt`, model told to `read_file` it
+  - Output too long -> saved whole to `sessions/<session-id>/tool_output/` (over `tool_output_max_bytes`, 40 KB), model gets preview + path (group 27)
   - Interruptible: polls the /stop flag and kills the process mid-run
 
 ### 15. Web search & fetch (Parallel API)
@@ -149,11 +149,19 @@
 
 ### 18. /stop - interrupt running work
 - [x] `/stop` interrupts the reply/tool turn running in the current chat+thread
-  - The bot is single-threaded, so an update-watcher thread owns getUpdates and feeds a queue; it intercepts /stop during an active turn (other messages are queued, never lost)
+  - The watcher thread owns getUpdates and feeds a queue; it intercepts /stop during the session's active turn (other messages are queued, never lost). Other sessions run on their own workers meanwhile (group 28)
   - Interruption points: every streaming delta, every tool round, before/after each tool, and mid-`bash` (process killed)
   - Context marker written for the next turn: "[This run was interrupted by the user before it finished - any running command/tool did not complete.]" (says the user interrupted, without referencing the /stop command)
   - Partial live message (edit mode) is deleted; user gets "stopped - the running reply/tool was interrupted"
   - Idle `/stop` replies "nothing is running right now"
+
+### 27. Tool rounds in history + spill files
+- [x] Tool input + output persist in session history (`sessions.db`) - the next turn carries them, so the model stops re-reading the same file on every message
+- [x] Failed/interrupted rounds stay in context too: a failing tool's error is a result; a provider error or `/stop` keeps the round and closes unanswered tool_calls with a "[not executed...]" placeholder (providers reject dangling calls)
+- [x] Output over `tool_output_max_bytes` (config, default **40 KB = 40k ASCII chars**) is written whole to `sessions/<session-id>/tool_output/<tool>-<sha1>.txt`
+  - Live: head preview + "full output saved to <path>" (OpenCode `truncate.ts` style); history: only the path (decision)
+  - Content-addressed names (identical output reuses one file); `/delete` and `/reset-all` remove the session's spill dir
+- [x] Front-trims/compaction strip orphaned leading tool results (a cut can separate a result from its call); auto-compact counts tool output toward the threshold
 
 ## P3 - Provider Foundation: Metadata, Priority & Cost (complete)
 
@@ -302,6 +310,13 @@
 - [x] User must confirm switching back to the normal flow (typed reply, same mechanics)
 - [x] Persist the mode flag back to config.toml (as at entry)
 - [x] After the switch: all bot messages are sent **without** a thread ID; **EVERY message that lands inside a topic is ignored - plain messages AND commands alike - and answered with a hint EVERY time** (topics are fully inert while flow is off; session recovery then works via `/session` from All only - `/session` from a topic applies while topic flow is ON)
+
+### 28. Concurrent sessions, mid-turn steering & live thinking
+- [x] **One worker per session key** (chat + topic): a turn streaming in one topic no longer blocks other topics/sessions - messages AND commands elsewhere run immediately; within a session everything stays ordered (the watcher still owns getUpdates and /stop)
+- [x] **Mid-turn injection**: a plain text message sent while its session's turn runs is parked in a thread-safe inbox and folded into context/history at the next tool boundary, marked "[sent while you were working...]" - steer the work without /stop; messages arriving after the last boundary are handled as the next turn
+- [x] **Every thinking block shown**: each completed round's reasoning is sent as its own collapsible block before that round's tool progress (the final round still ships inline with the answer); `/thinking off` hides them
+- [x] Thread-safety: SQLite store on one locked connection (`check_same_thread=False` + RLock), `config.write_value` locked, session slot/counter ops locked; cosmetic sends never break a turn
+- [x] Decisions: same-session commands wait for the turn (`/stop` excepted); only text injects (media/commands queue)
 
 ## P5 - Custom Providers, Setup Script & Question Tool (last)
 

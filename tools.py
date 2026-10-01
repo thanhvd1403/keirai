@@ -3,14 +3,15 @@
 Tools are OpenAI function-calling specs handed to the provider; execute()
 runs them locally and returns text for the model. Safety per project rules:
 - bash: destructive-command blacklist + timeout (agent-settable 1..300s)
-- long output: saved to a file, model is told to read_file it
+- long output: over tool_output_max_bytes (default 40 KB = 40k ASCII chars)
+  the full text is saved to sessions/<sid>/tool_output/ and the model gets a
+  preview + path (OpenCode style); history stores only the path
 - file tools: no path sandbox (single trusted operator), size caps only
 Handlers never raise: errors come back as strings so the tool loop continues.
 """
+import hashlib
 import os
 import re
-import secrets
-import shutil
 import subprocess
 import time
 
@@ -20,9 +21,8 @@ import websearch
 
 # No round cap (user directive): tool rounds continue until the model stops
 # asking for tools. /stop interrupts a runaway turn at any round.
-RESULT_CAP = 40_000   # chars of tool output fed back to the model
-OUTPUT_CAP = 40_000   # bash output kept inline; beyond -> file
-READ_CAP = 200_000    # read_file hard cap
+SPILL_BYTES = 40_000   # default: outputs over 40 KB go to a file (cfg: tool_output_max_bytes)
+READ_CAP = 200_000     # read_file hard cap
 
 # Destructive / reckless commands the model must never run.
 BASH_DENY = [
@@ -121,9 +121,14 @@ def available_specs(cfg):
 # ---------------------------------------------------------------- exec
 
 def execute(cfg, name, args, ctx=None):
-    """Run a tool. Returns text for the model; never raises."""
+    """Run a tool. Returns text for the model; never raises.
+
+    Output over cfg.tool_output_max_bytes (default SPILL_BYTES = 40 KB) is
+    written whole to sessions/<sid>/tool_output/ and returned as a head
+    preview + path; on success ctx["_spill"] = (path, bytes) tells the
+    caller to keep only the path in the session history."""
     args = args if isinstance(args, dict) else {}
-    ctx = ctx or {}
+    ctx = ctx if isinstance(ctx, dict) else {}
     handler = {"read_file": _read_file, "write_file": _write_file,
                "edit_file": _edit_file, "bash": _bash,
                "web_search": _web_search, "web_fetch": _web_fetch,
@@ -138,9 +143,36 @@ def execute(cfg, name, args, ctx=None):
         return "error: %s: %s" % (type(e).__name__, e)
     if out is None:
         return ""
-    if len(out) > RESULT_CAP:
-        out = out[:RESULT_CAP] + "\n... [output truncated at %d chars]" % RESULT_CAP
+    limit = int(getattr(cfg, "tool_output_max_bytes", 0) or SPILL_BYTES)
+    if len(out.encode("utf-8", "replace")) > limit:
+        return _spill(cfg, ctx, name, out, limit)
     return out
+
+
+def _spill(cfg, ctx, tool, text, limit):
+    """Save the full output under sessions/<sid>/tool_output/ and return a
+    head preview + the path (OpenCode's truncate.ts style). Content-addressed
+    file names, so identical output reuses the same file. Never raises: when
+    the disk write fails we fall back to an inline truncation."""
+    total = len(text.encode("utf-8", "replace"))
+    shown = text[:limit]
+    sid = str(ctx.get("spill_session") or ctx.get("session_id") or "misc")
+    try:
+        d = os.path.join(config_mod.base_dir(cfg), "sessions", sid, "tool_output")
+        os.makedirs(d, exist_ok=True)
+        digest = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:10]
+        path = os.path.join(d, "%s-%s.txt"
+                            % (re.sub(r"[^A-Za-z0-9_.-]", "_", tool), digest))
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+    except Exception as e:
+        return shown + ("\n... [output truncated at %d chars: could not save "
+                        "the full output: %s]" % (limit, e))
+    ctx["_spill"] = (path, total)
+    return (shown
+            + "\n... [output truncated: %d bytes total, full output saved to %s"
+              " - use read_file to read more]" % (total, path))
 
 
 def preview(name, args):
@@ -259,20 +291,8 @@ def _bash(cfg, args, ctx):
         header = "TIMED OUT after %ds (output below may be partial)\n" % timeout
     else:
         header = "exit code %d\n" % proc.returncode
-    body = header + out
-    if len(body) <= OUTPUT_CAP:
-        return body
-    # too long: save full output, hand back a head + the path
-    logdir = os.path.join(config_mod.base_dir(cfg), "logs")
-    os.makedirs(logdir, exist_ok=True)
-    path = os.path.join(logdir, "bash-out-%s-%s.txt"
-                        % (time.strftime("%Y%m%d-%H%M%S"), secrets.token_hex(3)))
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(body)
-    head = body[:OUTPUT_CAP]
-    return (head
-            + "\n... [output truncated: full output saved to %s - use read_file to "
-              "read more]" % path)
+    # oversized output is spilled to a file by execute() like every tool
+    return header + out
 
 
 # ---------------------------------------------------------------- web

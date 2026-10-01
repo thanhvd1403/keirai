@@ -677,6 +677,32 @@ class TestPersistence(unittest.TestCase):
         self.store.conn.commit()
         self.assertEqual(self.store.load_sessions(), [])
 
+    def test_threaded_writes(self):
+        """Session workers run concurrently: the shared connection must
+        accept interleaved writes from several threads (lock + no
+        check_same_thread)."""
+        import threading
+        errs = []
+
+        def worker(cid):
+            try:
+                for i in range(20):
+                    self.store.save_session(
+                        cid, 0, None, [{"role": "user", "content": "m%d" % i}])
+                    self.store.ensure_meta(cid, 0)
+                    self.store.record_usage(cid, 0, 0.001,
+                                            {"tokens_in": 1, "tokens_out": 2})
+            except Exception as e:  # pragma: no cover
+                errs.append(e)
+
+        threads = [threading.Thread(target=worker, args=(c,)) for c in (1, 2, 3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errs, [])
+        self.assertEqual({r[0] for r in self.store.list_sessions()}, {1, 2, 3})
+
 
 class TestCLI(unittest.TestCase):
     def setUp(self):
@@ -835,9 +861,13 @@ class TestToolLoop(unittest.TestCase):
         # final answer delivered
         self.assertEqual(self.tg.rich[-1][1],
                          {"markdown": "the content is SECRET-CONTENT-42"})
-        # history keeps only user + final assistant (tool rounds not persisted)
+        # history keeps the whole round: user + tool_calls + result + answer
         hist = self.state.get_history(100, None)
-        self.assertEqual([m["role"] for m in hist], ["user", "assistant"])
+        self.assertEqual([m["role"] for m in hist],
+                         ["user", "assistant", "tool", "assistant"])
+        self.assertIn("SECRET-CONTENT-42", hist[2]["content"])
+        self.assertEqual(hist[1]["tool_calls"][0]["function"]["name"],
+                         "read_file")
         # second request carried the tool result + tool specs
         second = chat_mock.call_args_list[1]
         msgs = second[0][3]
@@ -870,6 +900,213 @@ class TestToolLoop(unittest.TestCase):
         last = chat_mock.call_args_list[-1][0][3]
         self.assertEqual(len([m for m in last if m.get("role") == "tool"]),
                          rounds)
+
+    @mock.patch.object(providers, "chat")
+    def test_tool_round_remembered_next_turn(self, chat_mock):
+        """The core fix: round N's input+output stay in history, so turn 2's
+        request already carries them - no re-reading the same file."""
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write("SECRET-CONTENT-42")
+        self.addCleanup(os.unlink, path)
+        chat_mock.side_effect = [
+            ("", "", [{"id": "c1", "name": "read_file",
+                       "arguments": {"path": path}}]),
+            ("first answer", "", None),
+            ("second answer", "", None),
+        ]
+        main.handle_message(self.cfg, self.tg, msg(text="read it"), self.state)
+        main.handle_message(self.cfg, self.tg, msg(text="and now?"), self.state)
+        turn2 = chat_mock.call_args_list[2][0][3]
+        tools_seen = [m for m in turn2 if m.get("role") == "tool"]
+        self.assertEqual(len(tools_seen), 1)
+        self.assertIn("SECRET-CONTENT-42", tools_seen[0]["content"])
+        # the assistant tool_calls (the input) ride along too
+        self.assertTrue(any(m.get("tool_calls") for m in turn2))
+
+    @mock.patch.object(providers, "chat")
+    def test_long_output_spilled_history_keeps_path(self, chat_mock):
+        """Over tool_output_max_bytes: the model sees preview + path live
+        (OpenCode style); history keeps only the path; the file holds the
+        full output."""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = make_config(tool_output_max_bytes=64)
+            cfg.path = os.path.join(td, "config.toml")  # spill dir -> temp
+            fd, path = tempfile.mkstemp(suffix=".txt")
+            os.close(fd)
+            big = "B" * 300
+            with open(path, "w") as f:
+                f.write(big)
+            self.addCleanup(os.unlink, path)
+            chat_mock.side_effect = [
+                ("", "", [{"id": "c1", "name": "read_file",
+                           "arguments": {"path": path}}]),
+                ("done reading", "", None)]
+            main.handle_message(cfg, self.tg, msg(text="read the big file"),
+                                self.state)
+            # live: head preview + save hint
+            live = [m for m in chat_mock.call_args_list[1][0][3]
+                    if m.get("role") == "tool"][0]["content"]
+            self.assertTrue(live.startswith("B" * 64))
+            self.assertIn("saved to", live)
+            # history: path only, payload gone
+            hist = [m for m in self.state.get_history(100, None)
+                    if m.get("role") == "tool"][0]["content"]
+            self.assertTrue(hist.startswith("[full tool output saved to "))
+            self.assertNotIn("B" * 64, hist)
+            saved = hist.split("saved to ", 1)[1].split(" (", 1)[0]
+            parts = saved.replace("\\", "/").split("/")
+            self.assertIn("sessions", parts)      # sessions/<sid>/tool_output
+            self.assertIn("tool_output", parts)
+            self.assertNotIn("keirai", parts)     # never the app-wide constant
+            with open(saved, encoding="utf-8") as f:
+                self.assertEqual(f.read(), big)
+
+    @mock.patch.object(providers, "chat")
+    def test_provider_error_keeps_tool_rounds(self, chat_mock):
+        """A failed turn keeps the user message + completed tool rounds
+        (a failing tool is itself a result and stays too)."""
+        chat_mock.side_effect = [
+            ("", "", [{"id": "c1", "name": "read_file",
+                       "arguments": {"path": "missing.txt"}}]),
+            RuntimeError("provider down")]
+        main.handle_message(self.cfg, self.tg, msg(text="hi"), self.state)
+        hist = self.state.get_history(100, None)
+        self.assertEqual([m["role"] for m in hist],
+                         ["user", "assistant", "tool"])
+        self.assertIn("no such file", hist[2]["content"])
+        self.assertTrue(any("error" in t for _c, t, _t in self.tg.sent))
+
+    @mock.patch.object(providers, "chat")
+    def test_interrupt_mid_tool_round_keeps_history(self, chat_mock):
+        """/stop during a round: results that ran stay, unanswered calls get
+        a placeholder, and the interrupt note closes the turn."""
+        state = self.state
+        chat_mock.side_effect = [
+            ("", "", [{"id": "c1", "name": "read_file",
+                       "arguments": {"path": "a"}},
+                      {"id": "c2", "name": "read_file",
+                       "arguments": {"path": "b"}}]),
+            ("never", "", None)]
+
+        def fake_exec(cfg, name, args, ctx):
+            state.request_interrupt((100, None))  # /stop lands mid-round
+            return "partial result"
+
+        with mock.patch.object(main.tools_mod, "execute", fake_exec):
+            main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        hist = state.get_history(100, None)
+        self.assertEqual([m["role"] for m in hist],
+                         ["user", "assistant", "tool", "tool", "assistant"])
+        self.assertEqual(hist[2]["content"], "partial result")
+        self.assertIn("not executed", hist[3]["content"])
+        self.assertIn("interrupted", hist[4]["content"])
+
+    def test_close_tool_rounds_and_trim_hygiene(self):
+        h = [{"role": "user", "content": "go"},
+             {"role": "assistant", "content": "", "tool_calls": [
+                 {"id": "a", "type": "function",
+                  "function": {"name": "x", "arguments": "{}"}},
+                 {"id": "b", "type": "function",
+                  "function": {"name": "y", "arguments": "{}"}}]},
+             {"role": "tool", "tool_call_id": "a", "content": "ok"}]
+        main._close_tool_rounds(h)
+        self.assertEqual(len(h), 4)
+        self.assertEqual(h[3]["tool_call_id"], "b")
+        main._close_tool_rounds(h)  # idempotent
+        self.assertEqual(len(h), 4)
+        # front-trim orphan: a tool result whose call was summarized away
+        h2 = [{"role": "tool", "tool_call_id": "gone", "content": "orphan"},
+              {"role": "user", "content": "u"},
+              {"role": "assistant", "content": "a"}]
+        main._trim(h2, limit=2)
+        self.assertEqual([m["role"] for m in h2], ["user", "assistant"])
+
+    @mock.patch.object(providers, "chat")
+    def test_mid_turn_message_injected_at_boundary(self, chat_mock):
+        """A message sent while the turn runs joins context right after the
+        current tool use - steering without /stop - and is persisted."""
+        state = self.state
+        key = (100, None)
+        calls = {"n": 0}
+
+        def fake(name, api_key, model, messages, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ("", "", [{"id": "c1", "name": "read_file",
+                                  "arguments": {"path": "a.txt"}}])
+            return ("steered", "", None)  # round 2 must see the injection
+
+        chat_mock.side_effect = fake
+        orig = main.tools_mod.execute
+
+        def exec_then_inject(cfg, name, args, ctx):
+            out = orig(cfg, name, args, ctx)
+            state.inject(key, {"message": msg(text="actually do X instead")})
+            return out
+
+        with mock.patch.object(main.tools_mod, "execute", exec_then_inject):
+            main.handle_message(self.cfg, self.tg, msg(text="start"), state)
+        # round 2's request carried the injected message
+        second = chat_mock.call_args_list[1][0][3]
+        hits = [m for m in second if m.get("role") == "user"
+                and "actually do X" in str(m.get("content"))]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("sent while you were working",
+                      str(hits[0]["content"]))
+        # persisted in history, inbox empty afterwards
+        self.assertTrue(any("actually do X" in str(m.get("content"))
+                            for m in state.get_history(100, None)))
+        self.assertEqual(state.take_inbox(key), [])
+
+    @mock.patch.object(providers, "chat")
+    def test_dispatch_injects_active_turn_else_queues(self, chat_mock):
+        """Dispatcher: plain text during an active turn -> inbox; commands
+        and idle-session work -> the session queue."""
+        state, cfg, tg = self.state, self.cfg, self.tg
+        key = (100, None)
+        plain = {"message": msg(text="steer me")}
+        cmd = {"message": msg(text="/context")}
+        with mock.patch.object(main, "_session_submit") as sub:
+            main._dispatch_update(cfg, tg, state, {}, plain)   # idle
+            sub.assert_called_once_with(cfg, tg, state, {}, key, plain)
+            sub.reset_mock()
+            state.begin_turn(key)
+            try:
+                main._dispatch_update(cfg, tg, state, {}, plain)  # active
+                sub.assert_not_called()
+                self.assertEqual(len(state.take_inbox(key)), 1)
+                main._dispatch_update(cfg, tg, state, {}, cmd)    # cmd waits
+                sub.assert_called_once()
+            finally:
+                state.end_turn(key)
+
+    @mock.patch.object(providers, "chat")
+    def test_thinking_block_each_round(self, chat_mock):
+        """Every completed round's reasoning is shown as its own block, not
+        just the last one after the turn ends."""
+        chat_mock.side_effect = [
+            ("", "why round one", [{"id": "c1", "name": "read_file",
+                                    "arguments": {"path": "x"}}]),
+            ("done", "why round two", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        htmls = [s.get("html") for _c, s, _t in self.tg.rich if s.get("html")]
+        self.assertTrue(any("why round one" in h for h in htmls))  # round 1
+        self.assertTrue(any("why round two" in h for h in htmls))  # final
+
+    @mock.patch.object(providers, "chat")
+    def test_thinking_blocks_hidden_when_off(self, chat_mock):
+        self.state.set_thinking(42, False)
+        chat_mock.side_effect = [
+            ("", "hidden thought", [{"id": "c1", "name": "read_file",
+                                     "arguments": {"path": "x"}}]),
+            ("done", "also hidden", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        htmls = [s.get("html") for _c, s, _t in self.tg.rich if s.get("html")]
+        self.assertFalse(any("Thinking" in h for h in htmls))
+        self.assertFalse(any("blockquote expandable" in t
+                             for _c, t, _th in self.tg.sent))
 
 
 class TestReplyTo(unittest.TestCase):
